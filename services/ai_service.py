@@ -1,5 +1,5 @@
 """
-AIService — Utilise Claude (Anthropic) pour :
+AIService — Utilise Groq (LLaMA 3.3 70B) pour :
   1. Détecter l'intention du client (intent)
   2. Extraire les entités (articles commandés, questions…)
   3. Générer une réponse WhatsApp naturelle et adaptée
@@ -8,12 +8,10 @@ AIService — Utilise Claude (Anthropic) pour :
 import json
 import logging
 import os
-
-import anthropic
+from groq import AsyncGroq
 
 logger = logging.getLogger(__name__)
 
-# ── Prompt système ─────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """\
 Tu es un assistant WhatsApp pour un restaurant de livraison / vente directe.
 Tu dois analyser le message du client et répondre UNIQUEMENT en JSON valide, sans markdown, sans explication.
@@ -51,9 +49,10 @@ RÈGLES IMPORTANTES :
 
 class AIService:
     def __init__(self):
-        self._client = anthropic.AsyncAnthropic(
-            api_key=os.getenv("ANTHROPIC_API_KEY", "")
+        self._client = AsyncGroq(
+            api_key=os.getenv("GROQ_API_KEY", "")
         )
+        self.model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
     async def analyze(
         self,
@@ -62,9 +61,6 @@ class AIService:
         menu: list,
         config: dict,
     ) -> dict:
-        """
-        Analyse un message client et retourne { intent, entities, reply }.
-        """
         menu_ctx    = self._build_menu_ctx(menu, config)
         session_ctx = self._build_session_ctx(session)
 
@@ -78,13 +74,16 @@ class AIService:
 
         raw = ""
         try:
-            response = await self._client.messages.create(
-                model="claude-sonnet-4-20250514",
+            response = await self._client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user",   "content": user_msg},
+                ],
                 max_tokens=512,
-                system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": user_msg}],
+                temperature=0.2,
             )
-            raw = response.content[0].text.strip()
+            raw = response.choices[0].message.content.strip()
 
             # Nettoyer d'éventuels blocs markdown
             if raw.startswith("```"):
@@ -94,20 +93,16 @@ class AIService:
                     raw = raw[4:]
 
             result = json.loads(raw.strip())
-            logger.info(f"🤖 Intent={result.get('intent')} | Items={result.get('entities', {}).get('items', [])}")
+            logger.info(f"🤖 [Groq] Intent={result.get('intent')} | Items={result.get('entities', {}).get('items', [])}")
             return result
 
         except json.JSONDecodeError:
-            logger.error(f"JSON invalide de l'IA : {raw[:300]}")
-            return self._fallback_response()
-        except anthropic.APIError as e:
-            logger.error(f"Anthropic API error : {e}")
+            logger.error(f"JSON invalide de Groq : {raw[:300]}")
             return self._fallback_response()
         except Exception as e:
-            logger.error(f"analyze() error : {e}", exc_info=True)
+            logger.error(f"Groq API error : {e}", exc_info=True)
             return self._fallback_response()
 
-    # ── Helpers ────────────────────────────────────────────────────────────────
     @staticmethod
     def _build_menu_ctx(menu: list, config: dict) -> str:
         devise = config.get("devise", "FCFA")
@@ -119,7 +114,7 @@ class AIService:
                     f"{item.get('nom')} [{item.get('categorie')}] "
                     f"{item.get('prix')} {devise}"
                 )
-        return " | ".join(parts[:40])  # Limite la taille du contexte
+        return " | ".join(parts[:40])
 
     @staticmethod
     def _build_session_ctx(session: dict) -> str:
