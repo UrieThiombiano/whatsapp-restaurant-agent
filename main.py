@@ -3,6 +3,8 @@
 Gère les webhooks Wasender, le routage des messages et les sessions clients.
 """
 
+import hashlib
+import hmac
 import logging
 import os
 from fastapi import FastAPI, Request, BackgroundTasks
@@ -36,6 +38,37 @@ sessions: dict = {}
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(title="🍽️ Restaurant WhatsApp Agent", version="1.0.0")
 
+WEBHOOK_SECRET = os.getenv("WASENDER_WEBHOOK_SECRET", "")
+
+
+def verify_wasender_signature(body: bytes, headers: dict) -> bool:
+    """
+    Vérifie la signature HMAC-SHA256 envoyée par Wasender.
+    Si aucun secret configuré → on laisse passer (mode dev).
+    """
+    if not WEBHOOK_SECRET:
+        return True  # Pas de secret configuré → on accepte tout
+
+    # Wasender envoie la signature dans X-Hub-Signature-256 ou X-Wasender-Signature
+    sig_header = (
+        headers.get("x-hub-signature-256") or
+        headers.get("x-wasender-signature") or
+        headers.get("x-signature") or
+        ""
+    ).replace("sha256=", "")
+
+    if not sig_header:
+        logger.warning("⚠️ Aucune signature dans les headers — requête acceptée quand même")
+        return True  # On accepte pour ne pas bloquer si Wasender change le header
+
+    expected = hmac.new(
+        WEBHOOK_SECRET.encode(),
+        body,
+        hashlib.sha256
+    ).hexdigest()
+
+    return hmac.compare_digest(expected, sig_header)
+
 
 @app.get("/")
 async def health_check():
@@ -49,13 +82,56 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
     On répond 200 immédiatement, on traite en arrière-plan.
     """
     try:
-        payload = await request.json()
-        logger.info(f"📥 Webhook reçu: {str(payload)[:200]}")
+        body    = await request.body()
+        headers = dict(request.headers)
+
+        # ── Log complet pour debug ─────────────────────────────────────────────
+        logger.info(f"📥 Headers reçus: {headers}")
+        logger.info(f"📥 Body brut: {body[:500]}")
+
+        # ── Vérification signature ─────────────────────────────────────────────
+        if not verify_wasender_signature(body, headers):
+            logger.error("❌ Signature invalide — requête rejetée")
+            return JSONResponse({"status": "unauthorized"}, status_code=401)
+
+        import json
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            logger.error(f"❌ Body non-JSON: {body[:200]}")
+            return JSONResponse({"status": "ok"}, status_code=200)
+
+        logger.info(f"📥 Payload parsé: {str(payload)[:400]}")
         background_tasks.add_task(handle_incoming, payload)
         return JSONResponse({"status": "ok"}, status_code=200)
+
     except Exception as e:
-        logger.error(f"Webhook parse error: {e}")
+        logger.error(f"Webhook error: {e}", exc_info=True)
         return JSONResponse({"status": "ok"}, status_code=200)  # Toujours 200
+
+
+@app.post("/webhook/debug")
+async def webhook_debug(request: Request):
+    """
+    Endpoint de debug — affiche le payload brut de Wasender.
+    À désactiver en production.
+    """
+    body    = await request.body()
+    headers = dict(request.headers)
+    import json
+    try:
+        payload = json.loads(body)
+    except Exception:
+        payload = body.decode(errors="replace")
+
+    logger.info(f"🔍 DEBUG webhook — Headers: {headers}")
+    logger.info(f"🔍 DEBUG webhook — Payload: {payload}")
+
+    return JSONResponse({
+        "headers": headers,
+        "payload": payload,
+        "body_raw": body.decode(errors="replace")[:1000]
+    })
 
 
 # ── Traitement principal ───────────────────────────────────────────────────────
