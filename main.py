@@ -5,6 +5,7 @@ Gère les webhooks Wasender, le routage des messages et les sessions clients.
 
 import hashlib
 import hmac
+import json
 import logging
 import os
 from fastapi import FastAPI, Request, BackgroundTasks
@@ -32,7 +33,7 @@ whatsapp       = WhatsAppService()
 audio_service  = AudioService()
 order_manager  = OrderManager(sheets_service)
 
-# ── Sessions en mémoire : { phone: { state, cart, name, pending_order } } ─────
+# ── Sessions en mémoire : { phone: { state, cart, name } } ───────────────────
 sessions: dict = {}
 
 # ── App ───────────────────────────────────────────────────────────────────────
@@ -41,35 +42,29 @@ app = FastAPI(title="🍽️ Restaurant WhatsApp Agent", version="1.0.0")
 WEBHOOK_SECRET = os.getenv("WASENDER_WEBHOOK_SECRET", "")
 
 
-def verify_wasender_signature(body: bytes, headers: dict) -> bool:
+# ── Vérification signature Wasender ───────────────────────────────────────────
+def verify_wasender_signature(headers: dict) -> bool:
     """
-    Vérifie la signature HMAC-SHA256 envoyée par Wasender.
-    Si aucun secret configuré → on laisse passer (mode dev).
+    Wasender envoie le secret brut dans x-webhook-secret (pas un HMAC).
+    On compare directement. Si pas de secret configuré → on accepte tout.
     """
     if not WEBHOOK_SECRET:
-        return True  # Pas de secret configuré → on accepte tout
+        return True
 
-    # Wasender envoie la signature dans X-Hub-Signature-256 ou X-Wasender-Signature
-    sig_header = (
-        headers.get("x-hub-signature-256") or
-        headers.get("x-wasender-signature") or
-        headers.get("x-signature") or
+    received = (
+        headers.get("x-webhook-secret") or
+        headers.get("x-webhook-signature") or
         ""
-    ).replace("sha256=", "")
+    ).strip()
 
-    if not sig_header:
-        logger.warning("⚠️ Aucune signature dans les headers — requête acceptée quand même")
-        return True  # On accepte pour ne pas bloquer si Wasender change le header
+    if not received:
+        logger.warning("⚠️ Aucun secret Wasender dans les headers — accepté quand même")
+        return True
 
-    expected = hmac.new(
-        WEBHOOK_SECRET.encode(),
-        body,
-        hashlib.sha256
-    ).hexdigest()
-
-    return hmac.compare_digest(expected, sig_header)
+    return hmac.compare_digest(WEBHOOK_SECRET.strip(), received)
 
 
+# ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.get("/")
 async def health_check():
     return {"status": "✅ opérationnel", "service": "Restaurant WhatsApp Agent"}
@@ -79,75 +74,166 @@ async def health_check():
 async def webhook(request: Request, background_tasks: BackgroundTasks):
     """
     Endpoint appelé par Wasender pour chaque nouveau message.
-    On répond 200 immédiatement, on traite en arrière-plan.
+    Répond 200 immédiatement, traite en arrière-plan.
     """
     try:
         body    = await request.body()
         headers = dict(request.headers)
 
-        # ── Log complet pour debug ─────────────────────────────────────────────
-        logger.info(f"📥 Headers reçus: {headers}")
-        logger.info(f"📥 Body brut: {body[:500]}")
-
-        # ── Vérification signature ─────────────────────────────────────────────
-        if not verify_wasender_signature(body, headers):
+        # Vérification signature
+        if not verify_wasender_signature(headers):
             logger.error("❌ Signature invalide — requête rejetée")
             return JSONResponse({"status": "unauthorized"}, status_code=401)
 
-        import json
         try:
             payload = json.loads(body)
         except json.JSONDecodeError:
             logger.error(f"❌ Body non-JSON: {body[:200]}")
             return JSONResponse({"status": "ok"}, status_code=200)
 
-        logger.info(f"📥 Payload parsé: {str(payload)[:400]}")
+        logger.info(f"📥 Webhook reçu | event={payload.get('event')} | body={str(body[:300])}")
         background_tasks.add_task(handle_incoming, payload)
         return JSONResponse({"status": "ok"}, status_code=200)
 
     except Exception as e:
         logger.error(f"Webhook error: {e}", exc_info=True)
-        return JSONResponse({"status": "ok"}, status_code=200)  # Toujours 200
+        return JSONResponse({"status": "ok"}, status_code=200)
 
 
 @app.post("/webhook/debug")
 async def webhook_debug(request: Request):
-    """
-    Endpoint de debug — affiche le payload brut de Wasender.
-    À désactiver en production.
-    """
+    """Debug — affiche le payload brut. Désactiver en production."""
     body    = await request.body()
     headers = dict(request.headers)
-    import json
     try:
         payload = json.loads(body)
     except Exception:
         payload = body.decode(errors="replace")
+    return JSONResponse({"headers": headers, "payload": payload})
 
-    logger.info(f"🔍 DEBUG webhook — Headers: {headers}")
-    logger.info(f"🔍 DEBUG webhook — Payload: {payload}")
 
-    return JSONResponse({
-        "headers": headers,
-        "payload": payload,
-        "body_raw": body.decode(errors="replace")[:1000]
-    })
+# ── Parseur Wasender (format réel observé dans les logs) ──────────────────────
+def parse_wasender_payload(payload: dict) -> tuple:
+    """
+    Extrait (phone, text, msg_type, media_url, push_name) depuis le webhook Wasender.
+
+    Format réel Wasender :
+    {
+      "event": "messages.received",
+      "sessionId": "...",
+      "data": {
+        "messages": {
+          "key": {
+            "fromMe": false,
+            "remoteJid": "xxx@lid",
+            "senderPn": "22675850712@s.whatsapp.net",
+            "cleanedSenderPn": "22675850712"
+          },
+          "pushName": "Urie THIOMBIANO",
+          "message": {
+            "conversation": "Coucou",
+            "audioMessage": {...},
+            "extendedTextMessage": {"text": "..."},
+            "imageMessage": {...}
+          }
+        }
+      }
+    }
+    """
+    phone = media_url = None
+    text = ""
+    msg_type = "text"
+    push_name = ""
+
+    # ── Ignorer les événements non-message ────────────────────────────────────
+    event = payload.get("event", "")
+    if event and event != "messages.received":
+        logger.info(f"⏭️  Événement ignoré : {event}")
+        return None, "", "ignored", None, ""
+
+    # ── Extraction du bloc messages ───────────────────────────────────────────
+    data = payload.get("data", {})
+    msg  = data.get("messages", {})
+
+    if not msg:
+        logger.warning("⚠️ Pas de bloc 'messages' dans data")
+        return None, "", "unknown", None, ""
+
+    key = msg.get("key", {})
+
+    # ── Ignorer les messages envoyés par le bot lui-même ──────────────────────
+    if key.get("fromMe", False):
+        logger.info("⏭️  Message fromMe ignoré")
+        return None, "", "fromMe", None, ""
+
+    # ── Phone ─────────────────────────────────────────────────────────────────
+    raw_phone = (
+        key.get("cleanedSenderPn") or
+        key.get("senderPn", "").replace("@s.whatsapp.net", "") or
+        key.get("remoteJid", "").replace("@c.us", "").replace("@lid", "") or
+        ""
+    ).strip()
+
+    if raw_phone:
+        phone = "+" + raw_phone if not raw_phone.startswith("+") else raw_phone
+
+    push_name = msg.get("pushName", "")
+
+    # ── Contenu du message ────────────────────────────────────────────────────
+    message_obj = msg.get("message", {})
+
+    # Texte simple (conversation)
+    if "conversation" in message_obj:
+        text     = message_obj["conversation"]
+        msg_type = "text"
+
+    # Texte étendu
+    elif "extendedTextMessage" in message_obj:
+        text     = message_obj["extendedTextMessage"].get("text", "")
+        msg_type = "text"
+
+    # Audio / vocal
+    elif "audioMessage" in message_obj or "pttMessage" in message_obj:
+        audio    = message_obj.get("audioMessage") or message_obj.get("pttMessage", {})
+        media_url = audio.get("url") or audio.get("directPath")
+        msg_type  = "audio"
+
+    # Image avec légende
+    elif "imageMessage" in message_obj:
+        text     = message_obj["imageMessage"].get("caption", "")
+        msg_type = "image"
+
+    # Bouton / liste (réponse rapide)
+    elif "buttonsResponseMessage" in message_obj:
+        text     = message_obj["buttonsResponseMessage"].get("selectedDisplayText", "")
+        msg_type = "text"
+    elif "listResponseMessage" in message_obj:
+        text     = message_obj["listResponseMessage"].get("title", "")
+        msg_type = "text"
+
+    else:
+        # Type inconnu → log pour debug
+        logger.warning(f"⚠️ Type de message inconnu : {list(message_obj.keys())}")
+        msg_type = "unknown"
+
+    logger.info(f"✅ Parsé — phone={phone} | type={msg_type} | text='{text[:60]}' | name={push_name}")
+    return phone, text.strip(), msg_type, media_url, push_name
 
 
 # ── Traitement principal ───────────────────────────────────────────────────────
 async def handle_incoming(payload: dict):
     phone = None
     try:
-        phone, text, msg_type, media_url = parse_wasender_payload(payload)
+        phone, text, msg_type, media_url, push_name = parse_wasender_payload(payload)
 
-        if not phone:
-            logger.warning("Aucun numéro trouvé dans le payload")
+        # Ignorer les événements non pertinents
+        if msg_type in ("ignored", "fromMe", "unknown") or not phone:
             return
 
-        logger.info(f"📱 De: {phone} | Type: {msg_type} | Texte: {str(text)[:60]}")
+        logger.info(f"📱 De: {phone} ({push_name}) | Type: {msg_type} | Texte: '{text[:60]}'")
 
         # ── Transcription audio ───────────────────────────────────────────────
-        if msg_type in ("audio", "voice", "ptt") and media_url:
+        if msg_type == "audio" and media_url:
             text = await audio_service.transcribe(media_url)
             if not text:
                 await whatsapp.send(phone, "🎤 Je n'ai pas pu transcrire votre vocal. Réessayez en texte !")
@@ -161,34 +247,37 @@ async def handle_incoming(payload: dict):
         session = sessions.get(phone, {
             "state": "idle",
             "cart": [],
-            "name": None,
+            "name": push_name or None,
             "pending_order": None
         })
+        # Mettre à jour le nom si on le récupère maintenant
+        if push_name and not session.get("name"):
+            session["name"] = push_name
 
         # ── Données Google Sheets ─────────────────────────────────────────────
         menu   = await sheets_service.get_menu()
         config = await sheets_service.get_config()
 
         # ── Analyse IA ────────────────────────────────────────────────────────
-        result  = await ai_service.analyze(text=text, session=session, menu=menu, config=config)
-        intent  = result.get("intent", "FALLBACK")
+        result   = await ai_service.analyze(text=text, session=session, menu=menu, config=config)
+        intent   = result.get("intent", "FALLBACK")
         entities = result.get("entities", {})
         ai_reply = result.get("reply", "")
 
-        logger.info(f"🤖 Intent: {intent} | Entities: {entities}")
+        logger.info(f"🤖 Intent={intent} | Entities={entities}")
 
         # ── Routage selon intent ──────────────────────────────────────────────
         if intent == "ORDER" and entities.get("items"):
             res = await order_manager.process_order_request(
                 phone, session, entities["items"], menu, config
             )
-            response_text = res["message"]
-            sessions[phone] = res["session"]
+            response_text    = res["message"]
+            sessions[phone]  = res["session"]
 
         elif intent == "CONFIRM" and session.get("state") == "awaiting_confirmation":
             res = await order_manager.finalize_order(phone, session, config)
-            response_text = res["message"]
-            sessions[phone] = res["session"]
+            response_text    = res["message"]
+            sessions[phone]  = res["session"]
 
         elif intent == "CANCEL":
             sessions[phone] = {
@@ -200,16 +289,16 @@ async def handle_incoming(payload: dict):
             response_text = "❌ Commande annulée. Je suis là si vous avez besoin ! 😊"
 
         elif intent == "MENU":
-            response_text = format_menu(menu, config)
+            response_text   = format_menu(menu, config)
             sessions[phone] = session
 
         elif intent == "CART":
-            response_text = format_cart(session, config)
+            response_text   = format_cart(session, config)
             sessions[phone] = session
 
         else:
             # GREET, INFO, HOURS, FALLBACK → réponse IA directe
-            response_text = ai_reply
+            response_text   = ai_reply
             sessions[phone] = session
 
         await whatsapp.send(phone, response_text)
@@ -219,61 +308,8 @@ async def handle_incoming(payload: dict):
         if phone:
             await whatsapp.send(
                 phone,
-                "⚠️ Une erreur s'est produite. Réessayez dans un instant ou appelez-nous directement. 🙏"
+                "⚠️ Une erreur s'est produite. Réessayez dans un instant ou appelez-nous. 🙏"
             )
-
-
-# ── Parseur Wasender (multi-format) ───────────────────────────────────────────
-def parse_wasender_payload(payload: dict) -> tuple:
-    """
-    Extrait (phone, text, msg_type, media_url) depuis le webhook Wasender.
-    Gère les deux formats courants (enveloppe `data` ou plat).
-    """
-    phone = media_url = None
-    text = ""
-    msg_type = "text"
-
-    data = payload.get("data", payload)
-
-    # Phone
-    raw_phone = (
-        data.get("from") or data.get("phone") or data.get("sender") or
-        payload.get("from") or payload.get("phone") or ""
-    )
-    if raw_phone:
-        phone = (
-            raw_phone
-            .replace("@c.us", "")
-            .replace("@s.whatsapp.net", "")
-            .strip()
-        )
-        if phone and not phone.startswith("+"):
-            phone = "+" + phone
-
-    # Type
-    msg_type = str(
-        data.get("type") or data.get("messageType") or payload.get("type", "text")
-    ).lower()
-
-    # Contenu texte
-    if msg_type in ("text", "chat", "extendedtextmessage", "conversation"):
-        body = (
-            data.get("body") or data.get("text") or
-            data.get("message") or payload.get("body") or ""
-        )
-        if isinstance(body, dict):
-            text = body.get("body", "") or body.get("text", "")
-        else:
-            text = str(body)
-
-    # Contenu audio
-    elif msg_type in ("audio", "voice", "ptt"):
-        media = data.get("audio") or data.get("media") or {}
-        if isinstance(media, dict):
-            media_url = media.get("url") or media.get("link")
-        media_url = media_url or data.get("mediaUrl") or data.get("url")
-
-    return phone, text.strip(), msg_type, media_url
 
 
 # ── Formateurs de messages ─────────────────────────────────────────────────────
@@ -317,9 +353,9 @@ def format_cart(session: dict, config: dict) -> str:
     lines = ["🛒 *Votre panier :*\n"]
     total = 0
     for item in cart:
-        qty       = item.get("quantite", 1)
-        nom       = item.get("nom", "")
-        prix      = item.get("prix", 0)
+        qty        = item.get("quantite", 1)
+        nom        = item.get("nom", "")
+        prix       = item.get("prix", 0)
         sous_total = qty * prix
         total     += sous_total
         lines.append(f"• {qty}x {nom} — {sous_total:.0f} {devise}")
