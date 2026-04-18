@@ -2,12 +2,14 @@
 AIService — Utilise Groq (LLaMA 3.3 70B) pour :
   1. Détecter l'intention du client (intent)
   2. Extraire les entités (articles commandés, questions…)
-  3. Générer une réponse WhatsApp naturelle et adaptée
+  3. Générer une réponse WhatsApp naturelle
+Groq est gratuit, ultra-rapide (~200ms) et sans carte bancaire.
 """
 
 import json
 import logging
 import os
+
 from groq import AsyncGroq
 
 logger = logging.getLogger(__name__)
@@ -52,15 +54,10 @@ class AIService:
         self._client = AsyncGroq(
             api_key=os.getenv("GROQ_API_KEY", "")
         )
-        self.model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+        if not os.getenv("GROQ_API_KEY"):
+            logger.warning("⚠️ GROQ_API_KEY non définie !")
 
-    async def analyze(
-        self,
-        text: str,
-        session: dict,
-        menu: list,
-        config: dict,
-    ) -> dict:
+    async def analyze(self, text: str, session: dict, menu: list, config: dict) -> dict:
         menu_ctx    = self._build_menu_ctx(menu, config)
         session_ctx = self._build_session_ctx(session)
 
@@ -75,13 +72,13 @@ class AIService:
         raw = ""
         try:
             response = await self._client.chat.completions.create(
-                model=self.model,
+                model="llama-3.3-70b-versatile",
+                max_tokens=512,
+                temperature=0.2,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user",   "content": user_msg},
                 ],
-                max_tokens=512,
-                temperature=0.2,
             )
             raw = response.choices[0].message.content.strip()
 
@@ -93,14 +90,14 @@ class AIService:
                     raw = raw[4:]
 
             result = json.loads(raw.strip())
-            logger.info(f"🤖 [Groq] Intent={result.get('intent')} | Items={result.get('entities', {}).get('items', [])}")
+            logger.info(f"🤖 Intent={result.get('intent')} | Items={result.get('entities', {}).get('items', [])}")
             return result
 
         except json.JSONDecodeError:
-            logger.error(f"JSON invalide de Groq : {raw[:300]}")
+            logger.error(f"JSON invalide de l'IA : {raw[:300]}")
             return self._fallback_response()
         except Exception as e:
-            logger.error(f"Groq API error : {e}", exc_info=True)
+            logger.error(f"analyze() error : {e}", exc_info=True)
             return self._fallback_response()
 
     @staticmethod
@@ -108,8 +105,7 @@ class AIService:
         devise = config.get("devise", "FCFA")
         parts  = []
         for item in menu:
-            dispo = str(item.get("disponible", "TRUE")).upper()
-            if dispo == "TRUE":
+            if str(item.get("disponible", "TRUE")).upper() == "TRUE":
                 parts.append(
                     f"{item.get('nom')} [{item.get('categorie')}] "
                     f"{item.get('prix')} {devise}"
