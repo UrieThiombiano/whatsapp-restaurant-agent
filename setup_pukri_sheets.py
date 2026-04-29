@@ -138,7 +138,8 @@ def main():
         print(f"\n❌ '{CREDENTIALS}' introuvable ! Place-le dans le même dossier.")
         sys.exit(1)
     except Exception as e:
-        print(f"\n❌ Connexion échouée : {e}")
+        print(f"\n❌ Connexion échouée : {type(e).__name__}: {e}")
+        import traceback; traceback.print_exc()
         sys.exit(1)
 
     print("\n📋 Création des onglets...")
