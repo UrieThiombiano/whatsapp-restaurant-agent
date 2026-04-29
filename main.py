@@ -1,6 +1,6 @@
 """
-🤖 PUKRI AI SYSTEMS — Agent WhatsApp
-Backend FastAPI · Claude claude-sonnet-4-5 · Wasender
+🤖 PUKRI AI SYSTEMS — Agent WhatsApp Commercial
+FastAPI · Claude claude-sonnet-4-5 · Wasender · Google Sheets
 """
 
 import hashlib
@@ -22,23 +22,23 @@ logger = logging.getLogger(__name__)
 
 from services.ai_service import AIService
 from services.whatsapp_service import WhatsAppService
+from services.sheets_service import SheetsService
 
 # ── Services ──────────────────────────────────────────────────────────────────
 ai_service = AIService()
 whatsapp   = WhatsAppService()
+sheets     = SheetsService()
 
-# ── Sessions : { phone: [ {role, content}, ... ] } ────────────────────────────
-# On garde l'historique complet par client (max 20 tours)
-sessions: dict = {}
-MAX_HISTORY = 20
+# ── Sessions : { phone: { history: [], name: str } } ─────────────────────────
+sessions: dict   = {}
+MAX_HISTORY      = 16   # 8 tours de conversation conservés
+WEBHOOK_SECRET   = os.getenv("WASENDER_WEBHOOK_SECRET", "")
 
-WEBHOOK_SECRET = os.getenv("WASENDER_WEBHOOK_SECRET", "")
-
-app = FastAPI(title="🤖 PUKRI AI SYSTEMS — Agent WhatsApp", version="2.0.0")
+app = FastAPI(title="🤖 PUKRI AI SYSTEMS Agent", version="2.0.0")
 
 
-# ── Vérification signature Wasender ───────────────────────────────────────────
-def verify_signature(headers: dict) -> bool:
+# ── Signature ─────────────────────────────────────────────────────────────────
+def verify_sig(headers: dict) -> bool:
     if not WEBHOOK_SECRET:
         return True
     received = (
@@ -65,29 +65,23 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
     try:
         body    = await request.body()
         headers = dict(request.headers)
-
-        if not verify_signature(headers):
+        if not verify_sig(headers):
             return JSONResponse({"status": "unauthorized"}, status_code=401)
-
         try:
             payload = json.loads(body)
         except json.JSONDecodeError:
             return JSONResponse({"status": "ok"}, status_code=200)
-
-        logger.info(f"📥 event={payload.get('event')} | {str(body[:200])}")
         background_tasks.add_task(handle_incoming, payload)
         return JSONResponse({"status": "ok"}, status_code=200)
-
     except Exception as e:
-        logger.error(f"Webhook error: {e}", exc_info=True)
+        logger.error(f"Webhook: {e}", exc_info=True)
         return JSONResponse({"status": "ok"}, status_code=200)
 
 
 # ── Parseur Wasender ──────────────────────────────────────────────────────────
 def parse_payload(payload: dict) -> tuple:
     """Retourne (phone, text, msg_type, push_name)"""
-    event = payload.get("event", "")
-    if event and event != "messages.received":
+    if payload.get("event", "") not in ("messages.received", ""):
         return None, "", "ignored", ""
 
     data = payload.get("data", {})
@@ -99,7 +93,6 @@ def parse_payload(payload: dict) -> tuple:
     if key.get("fromMe", False):
         return None, "", "fromMe", ""
 
-    # Phone
     raw = (
         key.get("cleanedSenderPn") or
         key.get("senderPn", "").replace("@s.whatsapp.net", "") or ""
@@ -107,10 +100,8 @@ def parse_payload(payload: dict) -> tuple:
     phone     = ("+" + raw) if raw and not raw.startswith("+") else raw
     push_name = msg.get("pushName", "")
 
-    # Contenu
     message_obj = msg.get("message", {})
-    text     = ""
-    msg_type = "text"
+    text, msg_type = "", "text"
 
     if "conversation" in message_obj:
         text = message_obj["conversation"]
@@ -125,7 +116,6 @@ def parse_payload(payload: dict) -> tuple:
     else:
         msg_type = "unknown"
 
-    logger.info(f"✅ phone={phone} | type={msg_type} | text='{text[:60]}' | name={push_name}")
     return phone, text.strip(), msg_type, push_name
 
 
@@ -138,49 +128,87 @@ async def handle_incoming(payload: dict):
         if msg_type in ("ignored", "fromMe", "unknown") or not phone:
             return
 
-        # Audio : on demande de réécrire en texte (Whisper non configuré ici)
+        logger.info(f"📱 {phone} ({push_name}) → '{text[:80]}' [{msg_type}]")
+
+        # Audio → demander de réécrire
         if msg_type == "audio":
             await whatsapp.send(
                 phone,
-                "🎤 Je reçois votre message vocal ! Pour mieux vous aider, "
-                "pouvez-vous réécrire votre question en texte ? 😊"
+                "🎤 Message vocal reçu !\n"
+                "Pour mieux vous aider, pouvez-vous réécrire votre question en texte ? 😊"
             )
             return
 
         if not text:
             return
 
-        logger.info(f"📱 De: {phone} ({push_name}) → '{text[:80]}'")
+        # ── Session ───────────────────────────────────────────────────────────
+        session   = sessions.get(phone, {"history": [], "name": push_name or ""})
+        if push_name and not session.get("name"):
+            session["name"] = push_name
+        name      = session.get("name", "")
+        history   = session["history"]
 
-        # ── Historique conversation ───────────────────────────────────────────
-        history = sessions.get(phone, [])
-
-        # Message de bienvenue si première interaction
-        if not history and push_name:
-            first_name = push_name.split()[0] if push_name else ""
-            greeting_ctx = (
-                f"[Le client s'appelle {first_name}. "
-                f"C'est son tout premier message. Accueille-le chaleureusement par son prénom.]"
+        # ── Message de bienvenue (1ère interaction) ────────────────────────────
+        if not history:
+            first_name = name.split()[0] if name else ""
+            ctx = (
+                f"[Contexte : nouveau client. "
+                f"{'Prénom : ' + first_name + '. ' if first_name else ''}"
+                f"Accueille-le chaleureusement et demande comment tu peux l'aider.]"
             )
-            history.append({"role": "user", "content": greeting_ctx})
-            welcome = await ai_service.chat(history)
-            history.append({"role": "assistant", "content": welcome})
-            await whatsapp.send(phone, welcome)
+            history.append({"role": "user", "content": ctx})
+            # On va générer le welcome avec le vrai message du client aussi
+            history.append({"role": "assistant", "content": ""})  # placeholder
 
-        # Ajouter le message du client
+        # ── Charger base connaissance + offres (parallèle) ────────────────────
+        kb, offres = await _load_context()
+
+        # ── Ajouter message client ─────────────────────────────────────────────
         history.append({"role": "user", "content": text})
 
-        # Générer la réponse
-        reply = await ai_service.chat(history)
+        # Nettoyer le placeholder vide si présent
+        history = [h for h in history if h.get("content") != ""]
+
+        # ── Appel IA ──────────────────────────────────────────────────────────
+        result    = await ai_service.chat(history, knowledge_base=kb, offres=offres)
+        reply     = result.get("reply", "")
+        action    = result.get("action", "NONE")
+        action_data = result.get("action_data", {})
+
+        if not reply:
+            reply = AIService._fallback_text()
+
+        # ── Ajouter réponse à l'historique ────────────────────────────────────
         history.append({"role": "assistant", "content": reply})
 
-        # Limiter l'historique (éviter context trop long)
-        if len(history) > MAX_HISTORY * 2:
-            # Garder les 2 premiers (contexte accueil) + les 10 derniers tours
-            history = history[:2] + history[-(MAX_HISTORY * 2 - 2):]
+        # Tronquer si trop long (garder les derniers MAX_HISTORY messages)
+        if len(history) > MAX_HISTORY:
+            history = history[-MAX_HISTORY:]
 
-        sessions[phone] = history
+        session["history"] = history
+        sessions[phone]    = session
 
+        # ── Actions Google Sheets ──────────────────────────────────────────────
+        if action == "LEAD":
+            await sheets.save_lead({
+                "telephone": phone,
+                "nom":       name,
+                "type":      action_data.get("type", "INTERET"),
+                "details":   action_data.get("details", text[:200]),
+                "statut":    "À traiter",
+            })
+            logger.info(f"📊 Lead enregistré : {phone} → {action_data.get('type')}")
+
+        elif action == "UNKNOWN":
+            await sheets.save_unknown_question(
+                phone=phone,
+                name=name,
+                question=action_data.get("question", text),
+            )
+            logger.info(f"❓ Question inconnue enregistrée : '{action_data.get('question', text)[:60]}'")
+
+        # ── Envoi réponse ─────────────────────────────────────────────────────
         await whatsapp.send(phone, reply)
 
     except Exception as e:
@@ -188,7 +216,28 @@ async def handle_incoming(payload: dict):
         if phone:
             await whatsapp.send(
                 phone,
-                "Je suis momentanément indisponible. 🙏\n"
+                "Désolé, je rencontre un souci technique. 🙏\n"
                 "Contactez-nous directement :\n"
                 "📱 72 91 80 81 / 75 85 07 12"
             )
+
+
+async def _load_context() -> tuple:
+    """Charge KB + offres en parallèle depuis Google Sheets."""
+    import asyncio
+    try:
+        kb, offres = await asyncio.gather(
+            sheets.get_knowledge_base(),
+            sheets.get_offres(),
+            return_exceptions=True
+        )
+        if isinstance(kb, Exception):
+            logger.error(f"KB error: {kb}")
+            kb = ""
+        if isinstance(offres, Exception):
+            logger.error(f"Offres error: {offres}")
+            offres = ""
+        return kb, offres
+    except Exception as e:
+        logger.error(f"_load_context: {e}")
+        return "", ""
