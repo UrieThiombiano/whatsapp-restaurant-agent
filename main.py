@@ -1,14 +1,14 @@
 """
-🤖 PUKRI AI SYSTEMS — Agent WhatsApp Commercial
-FastAPI · Claude claude-sonnet-4-5 · Wasender · Google Sheets
+🤖 PUKRI AI SYSTEMS — Agent WhatsApp Commercial v4
+FastAPI · Claude claude-sonnet-4-5 · Wasender · Google Sheets · Supabase
 """
 
 import hashlib
-import time
 import hmac
 import json
 import logging
 import os
+import time
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
@@ -21,24 +21,39 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-from services.ai_service import AIService
+from services.ai_service      import AIService
 from services.whatsapp_service import WhatsAppService
-from services.sheets_service import SheetsService
+from services.sheets_service  import SheetsService
+from services.supabase_service import SupabaseService
 
 # ── Services ──────────────────────────────────────────────────────────────────
 ai_service = AIService()
 whatsapp   = WhatsAppService()
 sheets     = SheetsService()
+supabase   = SupabaseService()
 
-# ── Sessions : { phone: { history: [], name: str } } ─────────────────────────
-sessions: dict   = {}
-MAX_HISTORY      = 16   # 8 tours de conversation conservés
-WEBHOOK_SECRET   = os.getenv("WASENDER_WEBHOOK_SECRET", "")
+# ── Cache session léger (évite de recharger Supabase à chaque message rapide) ─
+# { phone: { history, name, last_seen, topics, last_loaded } }
+_session_cache: dict = {}
+SESSION_CACHE_TTL = 300  # 5 min — après, on recharge depuis Supabase
 
-app = FastAPI(title="🤖 PUKRI AI SYSTEMS Agent", version="2.0.0")
+WEBHOOK_SECRET = os.getenv("WASENDER_WEBHOOK_SECRET", "")
+
+app = FastAPI(title="🤖 PUKRI AI SYSTEMS Agent", version="4.0.0")
 
 
-# ── Signature ─────────────────────────────────────────────────────────────────
+# ── Health ────────────────────────────────────────────────────────────────────
+@app.get("/")
+async def health():
+    return {
+        "status": "✅ opérationnel",
+        "agent":  "PUKRI AI SYSTEMS",
+        "model":  "claude-sonnet-4-5",
+        "memory": "Supabase"
+    }
+
+
+# ── Signature Wasender ────────────────────────────────────────────────────────
 def verify_sig(headers: dict) -> bool:
     if not WEBHOOK_SECRET:
         return True
@@ -51,16 +66,7 @@ def verify_sig(headers: dict) -> bool:
     return hmac.compare_digest(WEBHOOK_SECRET.strip(), received)
 
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
-@app.get("/")
-async def health():
-    return {
-        "status": "✅ opérationnel",
-        "agent": "PUKRI AI SYSTEMS",
-        "model": "claude-sonnet-4-5"
-    }
-
-
+# ── Webhook ───────────────────────────────────────────────────────────────────
 @app.post("/webhook")
 async def webhook(request: Request, background_tasks: BackgroundTasks):
     try:
@@ -81,15 +87,12 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
 
 # ── Parseur Wasender ──────────────────────────────────────────────────────────
 def parse_payload(payload: dict) -> tuple:
-    """Retourne (phone, text, msg_type, push_name)"""
     if payload.get("event", "") not in ("messages.received", ""):
         return None, "", "ignored", ""
-
     data = payload.get("data", {})
     msg  = data.get("messages", {})
     if not msg:
         return None, "", "unknown", ""
-
     key = msg.get("key", {})
     if key.get("fromMe", False):
         return None, "", "fromMe", ""
@@ -100,7 +103,6 @@ def parse_payload(payload: dict) -> tuple:
     ).strip()
     phone     = ("+" + raw) if raw and not raw.startswith("+") else raw
     push_name = msg.get("pushName", "")
-
     message_obj = msg.get("message", {})
     text, msg_type = "", "text"
 
@@ -120,6 +122,37 @@ def parse_payload(payload: dict) -> tuple:
     return phone, text.strip(), msg_type, push_name
 
 
+# ── Chargement session depuis cache ou Supabase ───────────────────────────────
+async def get_session(phone: str, push_name: str) -> dict:
+    """
+    Charge la session depuis le cache local (rapide) ou Supabase (persistant).
+    Retourne { history, name, last_seen, topics, last_loaded }
+    """
+    now = time.time()
+    cached = _session_cache.get(phone)
+
+    # Cache valide → retourner directement
+    if cached and (now - cached.get("last_loaded", 0)) < SESSION_CACHE_TTL:
+        if push_name and not cached.get("name"):
+            cached["name"] = push_name
+        return cached
+
+    # Sinon → charger depuis Supabase
+    logger.info(f"📡 Chargement Supabase pour {phone}")
+    history = await supabase.load_history(phone)
+    meta    = await supabase.load_client_meta(phone)
+
+    session = {
+        "history":     history,
+        "name":        meta.get("name") or push_name or "",
+        "last_seen":   meta.get("last_seen"),
+        "topics":      meta.get("topics", []),
+        "last_loaded": now,
+    }
+    _session_cache[phone] = session
+    return session
+
+
 # ── Traitement principal ───────────────────────────────────────────────────────
 async def handle_incoming(payload: dict):
     phone = None
@@ -136,105 +169,106 @@ async def handle_incoming(payload: dict):
             await whatsapp.send(
                 phone,
                 "🎤 Message vocal reçu !\n"
-                "Pour mieux vous aider, pouvez-vous réécrire votre question en texte ? 😊"
+                "Pour mieux vous aider, pouvez-vous réécrire en texte ? 😊"
             )
             return
 
         if not text:
             return
 
-        # ── Session ───────────────────────────────────────────────────────────
-        session   = sessions.get(phone, {"history": [], "name": push_name or "", "last_seen": None, "topics": []})
-        if push_name and not session.get("name"):
-            session["name"] = push_name
-        name      = session.get("name", "")
-        history   = session["history"]
-        last_seen = session.get("last_seen")
-        now_ts    = time.time()
-
-        # ── Calcul de l'absence ───────────────────────────────────────────────
-        absence_hours = ((now_ts - last_seen) / 3600) if last_seen else None
-        session["last_seen"] = now_ts
-
-        # ── Contexte pour l'IA ────────────────────────────────────────────────
+        # ── Session (cache + Supabase) ────────────────────────────────────────
+        session    = await get_session(phone, push_name)
+        name       = session.get("name") or push_name or ""
+        history    = session.get("history", [])
+        last_seen  = session.get("last_seen")
+        topics     = session.get("topics", [])
+        now_ts     = time.time()
         first_name = name.split()[0] if name else ""
 
+        # ── Calcul absence ────────────────────────────────────────────────────
+        absence_hours = None
+        if last_seen:
+            try:
+                from datetime import datetime, timezone
+                if isinstance(last_seen, str):
+                    ls = datetime.fromisoformat(last_seen.replace("Z", "+00:00"))
+                    absence_hours = (datetime.now(timezone.utc) - ls).total_seconds() / 3600
+            except Exception:
+                pass
+
+        # ── Contexte pour l'IA ────────────────────────────────────────────────
         if not history:
-            # Première interaction
             ctx = (
                 f"[Nouveau client.{' Prénom : ' + first_name + '.' if first_name else ''} "
-                f"Accueille-le chaleureusement, présente PUKRI AI SYSTEMS en 1-2 lignes max "
+                f"Accueille-le chaleureusement, présente PUKRI AI SYSTEMS en 1-2 lignes "
                 f"et demande comment tu peux l'aider.]"
             )
-            history.append({"role": "user", "content": ctx})
-            history.append({"role": "assistant", "content": ""})  # placeholder
-        elif absence_hours and absence_hours > 2:
-            # Client de retour après une absence
-            topics = session.get("topics", [])
+            history = [{"role": "user", "content": ctx},
+                       {"role": "assistant", "content": ""}]
+
+        elif absence_hours and absence_hours > 3:
             topic_hint = f"Vous aviez parlé de : {', '.join(topics[-2:])}." if topics else ""
             ctx = (
-                f"[Le client {first_name or 'ce client'} revient après {absence_hours:.0f}h d'absence. "
-                f"{topic_hint} "
-                f"Reprends comme une vraie connaissance — pas de 'Bonjour' formel. "
-                f"Fais-lui sentir qu'il est chez lui, que tu te souviens de lui.]"
+                f"[{first_name or 'Ce client'} revient après {absence_hours:.0f}h. "
+                f"{topic_hint} Reprends comme une vraie connaissance — "
+                f"pas de Bonjour formel. Fais-lui sentir qu'il est chez lui.]"
             )
-            history.append({"role": "user", "content": ctx})
-            history.append({"role": "assistant", "content": ""})  # placeholder
+            history.append({"role": "user",      "content": ctx})
+            history.append({"role": "assistant",  "content": ""})
 
-        # ── Charger base connaissance + offres (parallèle) ────────────────────
-        kb, offres = await _load_context()
-
-        # ── Tracker le sujet de la conversation ──────────────────────────────
-        topics = session.get("topics", [])
-        if any(w in text.lower() for w in ["formation", "prix", "tarif", "coût", "agent", "consulting"]):
-            kw = next((w for w in ["formation","agent","consulting","prix"] if w in text.lower()), "")
-            if kw and kw not in topics:
-                topics.append(kw)
-        session["topics"] = topics[-5:]  # Garder les 5 derniers
-
-        # ── Ajouter message client ─────────────────────────────────────────────
-        history.append({"role": "user", "content": text})
-
-        # Nettoyer le placeholder vide si présent
+        # Nettoyer placeholders vides
         history = [h for h in history if h.get("content") != ""]
 
+        # ── Tracker les sujets ────────────────────────────────────────────────
+        for kw in ["formation", "agent", "consulting", "prix", "tarif"]:
+            if kw in text.lower() and kw not in topics:
+                topics.append(kw)
+        topics = topics[-5:]
+
+        # ── Charger base connaissance + offres ────────────────────────────────
+        kb, offres = await _load_context()
+
         # ── Appel IA ──────────────────────────────────────────────────────────
-        result    = await ai_service.chat(history, knowledge_base=kb, offres=offres)
-        reply     = result.get("reply", "")
-        action    = result.get("action", "NONE")
+        history.append({"role": "user", "content": text})
+        result  = await ai_service.chat(history, knowledge_base=kb, offres=offres)
+        reply   = result.get("reply", "") or AIService._fallback()
+        action  = result.get("action", "NONE")
         action_data = result.get("action_data", {})
 
-        if not reply:
-            reply = AIService._fallback_text()
+        # ── Sauvegarder en Supabase ───────────────────────────────────────────
+        await supabase.save_message(phone, name, "user",      text,  topics)
+        await supabase.save_message(phone, name, "assistant", reply, topics)
 
-        # ── Ajouter réponse à l'historique ────────────────────────────────────
+        # ── Mettre à jour historique IA (limité à 40 messages) ────────────────
         history.append({"role": "assistant", "content": reply})
+        if len(history) > 40:
+            history = history[-40:]
 
-        # Tronquer si trop long (garder les derniers MAX_HISTORY messages)
-        if len(history) > MAX_HISTORY:
-            history = history[-MAX_HISTORY:]
+        # ── Mettre à jour cache local ─────────────────────────────────────────
+        _session_cache[phone] = {
+            "history":     history,
+            "name":        name,
+            "last_seen":   None,   # Supabase sera la source de vérité
+            "topics":      topics,
+            "last_loaded": time.time(),
+        }
 
-        session["history"] = history
-        sessions[phone]    = session
-
-        # ── Actions Google Sheets ──────────────────────────────────────────────
+        # ── Actions Google Sheets ─────────────────────────────────────────────
         if action == "LEAD":
             await sheets.save_lead({
                 "telephone": phone,
                 "nom":       name,
                 "type":      action_data.get("type", "INTERET"),
                 "details":   action_data.get("details", text[:200]),
-                "statut":    "À traiter",
             })
-            logger.info(f"📊 Lead enregistré : {phone} → {action_data.get('type')}")
-
         elif action == "UNKNOWN":
-            await sheets.save_unknown_question(
-                phone=phone,
-                name=name,
-                question=action_data.get("question", text),
-            )
-            logger.info(f"❓ Question inconnue enregistrée : '{action_data.get('question', text)[:60]}'")
+            await sheets.save_unknown_question(phone, name,
+                action_data.get("question", text))
+
+        # ── Nettoyage périodique (1 fois sur 20) ──────────────────────────────
+        import random
+        if random.randint(1, 20) == 1:
+            await supabase.cleanup_old_messages(phone)
 
         # ── Envoi réponse ─────────────────────────────────────────────────────
         await whatsapp.send(phone, reply)
@@ -244,14 +278,12 @@ async def handle_incoming(payload: dict):
         if phone:
             await whatsapp.send(
                 phone,
-                "Désolé, je rencontre un souci technique. 🙏\n"
-                "Contactez-nous directement :\n"
-                "📱 72 91 80 81 / 75 85 07 12"
+                "Désolé, souci technique momentané. 🙏\n"
+                "Contactez-nous : 📱 72 91 80 81 / 75 85 07 12"
             )
 
 
 async def _load_context() -> tuple:
-    """Charge KB + offres en parallèle depuis Google Sheets."""
     import asyncio
     try:
         kb, offres = await asyncio.gather(
@@ -259,13 +291,7 @@ async def _load_context() -> tuple:
             sheets.get_offres(),
             return_exceptions=True
         )
-        if isinstance(kb, Exception):
-            logger.error(f"KB error: {kb}")
-            kb = ""
-        if isinstance(offres, Exception):
-            logger.error(f"Offres error: {offres}")
-            offres = ""
-        return kb, offres
-    except Exception as e:
-        logger.error(f"_load_context: {e}")
+        return (kb if not isinstance(kb, Exception) else ""), \
+               (offres if not isinstance(offres, Exception) else "")
+    except Exception:
         return "", ""

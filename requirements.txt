@@ -6,3 +6,4 @@ anthropic==0.28.0
 gspread==6.1.2
 google-auth==2.29.0
 python-multipart==0.0.9
+supabase==2.4.6
