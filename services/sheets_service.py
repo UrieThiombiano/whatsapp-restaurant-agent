@@ -1,11 +1,6 @@
 """
-SheetsService PUKRI — Google Sheet comme cerveau vivant de l'agent.
-
-4 onglets :
-  Base_Connaissance → FAQ dynamique que l'agent consulte à chaque message
-  Leads             → RDV + commandes + prospects intéressés
-  Questions_Inconnues → Ce que l'agent ne savait pas répondre (à traiter)
-  Offres            → Détail des offres et prix (modifiable sans toucher au code)
+SheetsService PUKRI v2 — Cache long (10 min) pour éviter quota Google Sheets.
+Fallback intégré sur les données essentielles si le Sheet est indisponible.
 """
 
 import asyncio
@@ -23,81 +18,105 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive.readonly",
 ]
-CACHE_TTL = 180  # 3 minutes pour la base de connaissance
+
+# Cache long pour ne pas dépasser le quota Google Sheets (60 req/min gratuit)
+CACHE_TTL = 600  # 10 minutes
+
+# ── Données de secours si le Sheet est inaccessible ───────────────────────────
+FALLBACK_OFFRES = """• Formation en ligne – Individuel : 29 990 FCFA / séance
+• Formation en ligne – Groupe (6-10 pers) : 23 990 FCFA / pers / séance
+• Formation sur site – Individuel (Ouaga) : 49 990 FCFA / séance
+• Formation sur site – Groupe (6-10 pers) : 49 990 FCFA / pers / séance
+• Agent IA – Installation : 499 990 FCFA à 999 990 FCFA (selon complexité)
+• Agent IA – Abonnement mensuel : 49 990 FCFA à 299 990 FCFA / mois
+• Consulting IA : Sur devis
+• Solution IA sur mesure : Sur devis"""
+
+FALLBACK_KB = """Q: C'est quoi PUKRI AI SYSTEMS ?
+R: PUKRI AI SYSTEMS est spécialisée dans l'IA pour entreprises africaines. On augmente votre productivité, automatise vos tâches et vous aide à générer plus de revenus. Pas de théorie — des résultats concrets.
+
+Q: C'est quoi l'intelligence artificielle ?
+R: L'IA c'est une technologie qui permet à une machine de réfléchir comme un humain pour aider à travailler plus vite et mieux. C'est ce que fait ChatGPT, Siri, ou les recommandations YouTube.
+
+Q: C'est quoi un agent IA ?
+R: Un agent IA c'est un assistant qui travaille pour vous automatiquement — répond à vos clients, prend des commandes, gère des tâches sans que vous soyez là. Exactement ce que vous utilisez maintenant !
+
+Q: Pourquoi choisir PUKRI ?
+R: On ne fait pas de théorie. On met en place des solutions concrètes adaptées à votre réalité. On comprend les entreprises africaines. On ne vend pas de l'IA, on apporte des résultats.
+
+Q: Comment nous contacter ?
+R: Appelez ou écrivez sur WhatsApp : 72 91 80 81 / 75 85 07 12. Email : contact.pukri.ai@gmail.com
+
+Q: Combien de temps dure une formation ?
+R: En général 2h à 4h par séance. Le nombre de séances dépend de vos objectifs. On s'adapte à vous.
+
+Q: Faut-il être expert en informatique ?
+R: Non ! Nos formations sont faites pour tout le monde, débutants complets inclus.
+
+Q: Vous êtes où ?
+R: Basés à Ouagadougou. Formations sur site à Ouaga, formations en ligne partout en Afrique."""
 
 
 class SheetsService:
     def __init__(self):
         self.sheet_id   = os.getenv("GOOGLE_SHEET_ID", "")
         self.creds_file = os.getenv("GOOGLE_CREDENTIALS_FILE", "google_credentials.json")
-        self._client       = None
-        self._spreadsheet  = None
-        self._kb_cache     = None
-        self._kb_ts        = 0.0
-        self._offres_cache = None
-        self._offres_ts    = 0.0
+        self._client        = None
+        self._spreadsheet   = None
+        self._kb_cache      = None
+        self._kb_ts         = 0.0
+        self._offres_cache  = None
+        self._offres_ts     = 0.0
+        self._sheets_ok     = True  # Flag pour ne pas réessayer si quota dépassé
 
-    # ── Connexion ──────────────────────────────────────────────────────────────
     def _get_client(self):
         if self._client is None:
             creds        = Credentials.from_service_account_file(self.creds_file, scopes=SCOPES)
             self._client = gspread.authorize(creds)
         return self._client
 
-    def _ws(self, name: str) -> gspread.Worksheet:
+    def _ws(self, name: str):
         if self._spreadsheet is None:
             self._spreadsheet = self._get_client().open_by_key(self.sheet_id)
         return self._spreadsheet.worksheet(name)
 
-    # ── Base de connaissance ────────────────────────────────────────────────────
     async def get_knowledge_base(self) -> str:
-        """
-        Retourne la base de connaissance formatée pour injection dans le prompt.
-        Colonnes : question | reponse | categorie
-        Cache 3 min.
-        """
         now = time.time()
-        if self._kb_cache and (now - self._kb_ts) < CACHE_TTL:
+        if self._kb_cache is not None and (now - self._kb_ts) < CACHE_TTL:
             return self._kb_cache
 
         def _fetch():
-            ws  = self._ws("Base_Connaissance")
-            return ws.get_all_records()
-
-        try:
-            rows   = await asyncio.get_event_loop().run_in_executor(None, _fetch)
-            lines  = []
+            ws   = self._ws("Base_Connaissance")
+            rows = ws.get_all_records()
+            lines = []
             for r in rows:
                 q = r.get("question", "").strip()
                 a = r.get("reponse", "").strip()
                 if q and a:
                     lines.append(f"Q: {q}\nR: {a}")
-            result = "\n\n".join(lines)
-            self._kb_cache = result
-            self._kb_ts    = now
-            logger.info(f"✅ Base connaissance : {len(rows)} entrées")
-            return result
-        except Exception as e:
-            logger.error(f"❌ get_knowledge_base : {e}")
-            return self._kb_cache or ""
+            return "\n\n".join(lines)
 
-    # ── Offres ─────────────────────────────────────────────────────────────────
+        try:
+            result = await asyncio.get_event_loop().run_in_executor(None, _fetch)
+            self._kb_cache = result or FALLBACK_KB
+            self._kb_ts    = now
+            self._sheets_ok = True
+            logger.info(f"✅ KB chargée depuis Sheets ({len(result)} chars)")
+            return self._kb_cache
+        except Exception as e:
+            logger.warning(f"⚠️ KB Sheet indisponible ({e}) → fallback")
+            self._kb_cache = FALLBACK_KB
+            self._kb_ts    = now  # Cache le fallback aussi pour éviter spam
+            return FALLBACK_KB
+
     async def get_offres(self) -> str:
-        """
-        Retourne le détail des offres depuis l'onglet Offres.
-        Colonnes : offre | description | prix | disponible
-        Cache 3 min.
-        """
         now = time.time()
-        if self._offres_cache and (now - self._offres_ts) < CACHE_TTL:
+        if self._offres_cache is not None and (now - self._offres_ts) < CACHE_TTL:
             return self._offres_cache
 
         def _fetch():
-            ws = self._ws("Offres")
-            return ws.get_all_records()
-
-        try:
-            rows  = await asyncio.get_event_loop().run_in_executor(None, _fetch)
+            ws   = self._ws("Offres")
+            rows = ws.get_all_records()
             lines = []
             for r in rows:
                 if str(r.get("disponible", "TRUE")).upper() == "TRUE":
@@ -105,67 +124,51 @@ class SheetsService:
                     desc  = r.get("description", "")
                     prix  = r.get("prix", "")
                     lines.append(f"• {offre} : {desc} — {prix}")
-            result = "\n".join(lines)
-            self._offres_cache = result
-            self._offres_ts    = now
-            logger.info(f"✅ Offres rechargées : {len(rows)} entrées")
-            return result
-        except Exception as e:
-            logger.error(f"❌ get_offres : {e}")
-            return self._offres_cache or ""
+            return "\n".join(lines)
 
-    # ── Enregistrer un lead ─────────────────────────────────────────────────────
+        try:
+            result = await asyncio.get_event_loop().run_in_executor(None, _fetch)
+            self._offres_cache = result or FALLBACK_OFFRES
+            self._offres_ts    = now
+            logger.info(f"✅ Offres chargées depuis Sheets ({len(result)} chars)")
+            return self._offres_cache
+        except Exception as e:
+            logger.warning(f"⚠️ Offres Sheet indisponible ({e}) → fallback")
+            self._offres_cache = FALLBACK_OFFRES
+            self._offres_ts    = now
+            return FALLBACK_OFFRES
+
     async def save_lead(self, lead: dict) -> bool:
-        """
-        Ajoute une ligne dans l'onglet Leads.
-        Colonnes : date | telephone | nom | type | details | statut | source
-        """
         def _save():
             ws = self._ws("Leads")
             ws.append_row([
                 lead.get("date", datetime.now().strftime("%Y-%m-%d %H:%M")),
                 lead.get("telephone", ""),
                 lead.get("nom", ""),
-                lead.get("type", ""),      # RDV / COMMANDE / INTERET
+                lead.get("type", ""),
                 lead.get("details", ""),
                 lead.get("statut", "À traiter"),
                 "WhatsApp Agent",
             ])
-
         try:
             await asyncio.get_event_loop().run_in_executor(None, _save)
-            logger.info(f"✅ Lead sauvegardé : {lead.get('type')} — {lead.get('telephone')}")
+            logger.info(f"✅ Lead : {lead.get('telephone')} → {lead.get('type')}")
             return True
         except Exception as e:
             logger.error(f"❌ save_lead : {e}")
             return False
 
-    # ── Enregistrer une question inconnue ──────────────────────────────────────
     async def save_unknown_question(self, phone: str, name: str, question: str) -> bool:
-        """
-        Ajoute dans l'onglet Questions_Inconnues pour traitement humain.
-        Colonnes : date | telephone | nom | question | statut
-        """
         def _save():
             ws = self._ws("Questions_Inconnues")
             ws.append_row([
                 datetime.now().strftime("%Y-%m-%d %H:%M"),
-                phone,
-                name,
-                question,
-                "À répondre",
+                phone, name, question, "À répondre",
             ])
-
         try:
             await asyncio.get_event_loop().run_in_executor(None, _save)
-            logger.info(f"✅ Question inconnue enregistrée : '{question[:60]}'")
+            logger.info(f"✅ Question inconnue : '{question[:60]}'")
             return True
         except Exception as e:
             logger.error(f"❌ save_unknown_question : {e}")
             return False
-
-    def invalidate_cache(self):
-        self._kb_cache     = None
-        self._offres_cache = None
-        self._kb_ts        = 0.0
-        self._offres_ts    = 0.0
