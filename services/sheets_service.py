@@ -196,6 +196,34 @@ class SheetsService:
             logger.error(f"❌ save_lead ERREUR : {type(e).__name__}: {e}", exc_info=True)
             return False
 
+    async def save_security_event(self, phone: str, name: str, question: str) -> bool:
+        """
+        Enregistre dans l'onglet Security toute tentative de manipulation
+        ou question de sécurité détectée par l'agent.
+        Colonnes : Date | Téléphone | Nom | Questions
+        """
+        logger.info(f"🔒 Tentative sécurité détectée : {phone} → '{question[:80]}'")
+        if not self.sheet_id:
+            logger.error("❌ save_security_event : GOOGLE_SHEET_ID non défini !")
+            return False
+
+        def _save():
+            ws = self._ws("Security")
+            ws.append_row([
+                datetime.now().strftime("%Y-%m-%d %H:%M"),
+                phone,
+                name or "",
+                question,
+            ])
+
+        try:
+            await asyncio.get_event_loop().run_in_executor(None, _save)
+            logger.info(f"✅ Événement sécurité enregistré : {phone}")
+            return True
+        except Exception as e:
+            logger.error(f"❌ save_security_event : {type(e).__name__}: {e}")
+            return False
+
     async def save_unknown_question(self, phone: str, name: str, question: str) -> bool:
         def _save():
             ws = self._ws("Questions_Inconnues")

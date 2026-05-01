@@ -272,6 +272,14 @@ async def handle_incoming(payload: dict):
             await sheets.save_unknown_question(phone, name,
                 action_data.get("question", text))
 
+        elif action == "SECURITY":
+            await sheets.save_security_event(
+                phone=phone,
+                name=name,
+                question=action_data.get("question", text),
+            )
+            logger.warning(f"🚨 Tentative sécurité enregistrée : {phone} → '{text[:80]}'")
+
         # ── Nettoyage périodique (1 fois sur 20) ──────────────────────────────
         import random
         if random.randint(1, 20) == 1:
