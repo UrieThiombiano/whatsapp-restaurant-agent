@@ -231,7 +231,14 @@ async def handle_incoming(payload: dict):
         # ── Appel IA ──────────────────────────────────────────────────────────
         history.append({"role": "user", "content": text})
         result  = await ai_service.chat(history, knowledge_base=kb, offres=offres)
-        reply   = result.get("reply", "") or AIService._fallback()
+        reply   = result.get("reply", "").strip()
+
+        # Message de clôture / rire / acquiescement → ne pas répondre
+        if not reply:
+            logger.info(f"🔇 Message sans réponse nécessaire ({phone}) — ignoré")
+            # Sauvegarder quand même le message client pour la mémoire
+            await supabase.save_message(phone, name, "user", text, topics)
+            return
         action  = result.get("action", "NONE")
         action_data = result.get("action_data", {})
 
