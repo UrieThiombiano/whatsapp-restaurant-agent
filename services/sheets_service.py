@@ -64,7 +64,41 @@ class SheetsService:
         self._kb_ts         = 0.0
         self._offres_cache  = None
         self._offres_ts     = 0.0
-        self._sheets_ok     = True  # Flag pour ne pas réessayer si quota dépassé
+        self._sheets_ok     = True
+        # Créer le fichier credentials depuis la variable d'env base64 si présent
+        self._init_credentials()
+
+    def _init_credentials(self):
+        """
+        Sur Render, on ne peut pas uploader de fichier.
+        On stocke le JSON encodé en base64 dans GOOGLE_CREDENTIALS_B64.
+        Cette méthode le décode et crée le fichier à la volée.
+        """
+        b64 = os.getenv("GOOGLE_CREDENTIALS_B64", "")
+        if b64:
+            import base64, json, tempfile
+            try:
+                decoded = base64.b64decode(b64).decode("utf-8")
+                # Valider que c'est bien du JSON
+                json.loads(decoded)
+                # Écrire dans un fichier temporaire
+                tmp = tempfile.NamedTemporaryFile(
+                    mode="w", suffix=".json", delete=False
+                )
+                tmp.write(decoded)
+                tmp.close()
+                self.creds_file = tmp.name
+                logger.info(f"✅ Credentials Google décodés depuis GOOGLE_CREDENTIALS_B64 → {self.creds_file}")
+            except Exception as e:
+                logger.error(f"❌ Décodage GOOGLE_CREDENTIALS_B64 échoué : {e}")
+        elif os.path.exists(self.creds_file):
+            logger.info(f"✅ Credentials Google trouvés : {self.creds_file}")
+        else:
+            logger.error(
+                f"❌ Pas de credentials Google ! "
+                f"Ajoute GOOGLE_CREDENTIALS_B64 sur Render. "
+                f"(base64 de ton google_credentials.json)"
+            )
 
     def _get_client(self):
         if self._client is None:
@@ -136,9 +170,14 @@ class SheetsService:
             return FALLBACK_OFFRES
 
     async def save_lead(self, lead: dict) -> bool:
+        logger.info(f"📊 Tentative save_lead : {lead}")
+        if not self.sheet_id:
+            logger.error("❌ save_lead : GOOGLE_SHEET_ID non défini !")
+            return False
+
         def _save():
             ws = self._ws("Leads")
-            ws.append_row([
+            row = [
                 lead.get("date", datetime.now().strftime("%Y-%m-%d %H:%M")),
                 lead.get("telephone", ""),
                 lead.get("nom", ""),
@@ -146,13 +185,15 @@ class SheetsService:
                 lead.get("details", ""),
                 lead.get("statut", "À traiter"),
                 "WhatsApp Agent",
-            ])
+            ]
+            logger.info(f"📊 Insertion ligne Leads : {row}")
+            ws.append_row(row)
         try:
             await asyncio.get_event_loop().run_in_executor(None, _save)
-            logger.info(f"✅ Lead : {lead.get('telephone')} → {lead.get('type')}")
+            logger.info(f"✅ Lead enregistré : {lead.get('telephone')} → {lead.get('type')}")
             return True
         except Exception as e:
-            logger.error(f"❌ save_lead : {e}")
+            logger.error(f"❌ save_lead ERREUR : {type(e).__name__}: {e}", exc_info=True)
             return False
 
     async def save_unknown_question(self, phone: str, name: str, question: str) -> bool:
