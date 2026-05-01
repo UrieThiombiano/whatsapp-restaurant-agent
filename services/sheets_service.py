@@ -47,9 +47,6 @@ R: On ne fait pas de théorie. On met en place des solutions concrètes adaptée
 Q: Comment nous contacter ?
 R: Appelez ou écrivez sur WhatsApp : 72 91 80 81 / 75 85 07 12. Email : contact.pukri.ai@gmail.com
 
-Q: Combien de temps dure une formation ?
-R: En général 2h à 4h par séance. Le nombre de séances dépend de vos objectifs. On s'adapte à vous.
-
 Q: Faut-il être expert en informatique ?
 R: Non ! Nos formations sont faites pour tout le monde, débutants complets inclus.
 
