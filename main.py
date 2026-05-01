@@ -4,6 +4,7 @@ FastAPI · Claude claude-sonnet-4-5 · Wasender · Google Sheets
 """
 
 import hashlib
+import time
 import hmac
 import json
 import logging
@@ -143,26 +144,53 @@ async def handle_incoming(payload: dict):
             return
 
         # ── Session ───────────────────────────────────────────────────────────
-        session   = sessions.get(phone, {"history": [], "name": push_name or ""})
+        session   = sessions.get(phone, {"history": [], "name": push_name or "", "last_seen": None, "topics": []})
         if push_name and not session.get("name"):
             session["name"] = push_name
         name      = session.get("name", "")
         history   = session["history"]
+        last_seen = session.get("last_seen")
+        now_ts    = time.time()
 
-        # ── Message de bienvenue (1ère interaction) ────────────────────────────
+        # ── Calcul de l'absence ───────────────────────────────────────────────
+        absence_hours = ((now_ts - last_seen) / 3600) if last_seen else None
+        session["last_seen"] = now_ts
+
+        # ── Contexte pour l'IA ────────────────────────────────────────────────
+        first_name = name.split()[0] if name else ""
+
         if not history:
-            first_name = name.split()[0] if name else ""
+            # Première interaction
             ctx = (
-                f"[Contexte : nouveau client. "
-                f"{'Prénom : ' + first_name + '. ' if first_name else ''}"
-                f"Accueille-le chaleureusement et demande comment tu peux l'aider.]"
+                f"[Nouveau client.{' Prénom : ' + first_name + '.' if first_name else ''} "
+                f"Accueille-le chaleureusement, présente PUKRI AI SYSTEMS en 1-2 lignes max "
+                f"et demande comment tu peux l'aider.]"
             )
             history.append({"role": "user", "content": ctx})
-            # On va générer le welcome avec le vrai message du client aussi
+            history.append({"role": "assistant", "content": ""})  # placeholder
+        elif absence_hours and absence_hours > 2:
+            # Client de retour après une absence
+            topics = session.get("topics", [])
+            topic_hint = f"Vous aviez parlé de : {', '.join(topics[-2:])}." if topics else ""
+            ctx = (
+                f"[Le client {first_name or 'ce client'} revient après {absence_hours:.0f}h d'absence. "
+                f"{topic_hint} "
+                f"Reprends comme une vraie connaissance — pas de 'Bonjour' formel. "
+                f"Fais-lui sentir qu'il est chez lui, que tu te souviens de lui.]"
+            )
+            history.append({"role": "user", "content": ctx})
             history.append({"role": "assistant", "content": ""})  # placeholder
 
         # ── Charger base connaissance + offres (parallèle) ────────────────────
         kb, offres = await _load_context()
+
+        # ── Tracker le sujet de la conversation ──────────────────────────────
+        topics = session.get("topics", [])
+        if any(w in text.lower() for w in ["formation", "prix", "tarif", "coût", "agent", "consulting"]):
+            kw = next((w for w in ["formation","agent","consulting","prix"] if w in text.lower()), "")
+            if kw and kw not in topics:
+                topics.append(kw)
+        session["topics"] = topics[-5:]  # Garder les 5 derniers
 
         # ── Ajouter message client ─────────────────────────────────────────────
         history.append({"role": "user", "content": text})
