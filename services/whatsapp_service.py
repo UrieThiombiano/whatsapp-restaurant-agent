@@ -49,32 +49,46 @@ class WhatsAppService:
         1. L'image du flyer (si disponible)
         2. La description complète
         3. Le lien d'inscription (si disponible)
+
+        Délais généreux entre chaque message pour respecter
+        la limite Wasender (1 msg/min sur plan gratuit).
         """
         ok = True
 
-        # 1. Flyer
+        # 1. Flyer image
         if offer.get("image_url"):
             img_ok = await self.send_image(phone, offer["image_url"])
             if not img_ok:
                 logger.warning(f"⚠️ Image offre non envoyée pour {phone}")
-            await asyncio.sleep(1.0)  # Petit délai entre image et texte
+            # Attendre 65s pour respecter la limite Wasender 1 msg/min
+            logger.info(f"⏳ Attente 65s avant envoi description (limite Wasender)...")
+            await asyncio.sleep(65)
 
-        # 2. Description
-        description = offer.get("description", "")
+        # 2. Description complète
+        description = offer.get("description", "").strip()
         if description:
-            ok = await self.send(phone, description)
-            await asyncio.sleep(0.8)
+            ok = await self._post_with_retry(phone, {"to": phone, "text": description})
+            await asyncio.sleep(65)
 
         # 3. Lien inscription
-        lien = offer.get("lien_inscription", "")
+        lien = offer.get("lien_inscription", "").strip()
         if lien:
-            ok = await self.send(
-                phone,
-                f"👉 *Inscrivez-vous ici :*\n{lien}\n\n"
-                f"⚠️ Places limitées — ne tardez pas !"
-            )
+            msg = f"👉 *Inscrivez-vous ici :*\n{lien}\n\n⚠️ Places limitées — ne tardez pas !"
+            ok = await self._post_with_retry(phone, {"to": phone, "text": msg})
 
         return ok
+
+    async def _post_with_retry(self, phone: str, payload: dict, max_retries: int = 3) -> bool:
+        """Envoie avec retry automatique en cas de 429 (rate limit)."""
+        for attempt in range(max_retries):
+            result = await self._post(phone, payload)
+            if result:
+                return True
+            if attempt < max_retries - 1:
+                wait = 65 * (attempt + 1)
+                logger.warning(f"⏳ Retry {attempt+1}/{max_retries} dans {wait}s...")
+                await asyncio.sleep(wait)
+        return False
 
     # ── Internals ──────────────────────────────────────────────────────────────
     async def _post(self, phone: str, payload: dict) -> bool:
