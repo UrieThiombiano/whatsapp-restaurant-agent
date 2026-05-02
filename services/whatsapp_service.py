@@ -45,50 +45,38 @@ class WhatsAppService:
     # ── Offre spéciale : image + message séparé ────────────────────────────────
     async def send_offer(self, phone: str, offer: dict) -> bool:
         """
-        Envoie une offre spéciale :
-        1. L'image du flyer (si disponible)
+        Envoie une offre spéciale complète (plan payant Wasender — pas de limite) :
+        1. Le flyer (image)
         2. La description complète
-        3. Le lien d'inscription (si disponible)
-
-        Délais généreux entre chaque message pour respecter
-        la limite Wasender (1 msg/min sur plan gratuit).
+        3. Le lien d'inscription
+        Tous les éléments sont TOUJOURS envoyés même si image_url est vide.
         """
         ok = True
 
-        # 1. Flyer image
-        if offer.get("image_url"):
-            img_ok = await self.send_image(phone, offer["image_url"])
-            if not img_ok:
-                logger.warning(f"⚠️ Image offre non envoyée pour {phone}")
-            # Attendre 65s pour respecter la limite Wasender 1 msg/min
-            logger.info(f"⏳ Attente 65s avant envoi description (limite Wasender)...")
-            await asyncio.sleep(65)
+        # 1. Flyer — toujours tenter si image_url présente
+        image_url = offer.get("image_url", "").strip()
+        if image_url:
+            img_ok = await self.send_image(phone, image_url)
+            logger.info(f"🖼️ Flyer {'envoyé ✅' if img_ok else 'échec ❌'} → {phone}")
+            await asyncio.sleep(0.8)
+        else:
+            logger.warning(f"⚠️ Pas d'image_url pour l'offre '{offer.get('titre','?')}' — vérifier Supabase")
 
-        # 2. Description complète
+        # 2. Description complète — OBLIGATOIRE
         description = offer.get("description", "").strip()
         if description:
-            ok = await self._post_with_retry(phone, {"to": phone, "text": description})
-            await asyncio.sleep(65)
+            ok = await self._post(phone, {"to": phone, "text": description})
+            logger.info(f"📝 Description {'envoyée ✅' if ok else 'échec ❌'} → {phone}")
+            await asyncio.sleep(0.8)
 
-        # 3. Lien inscription
+        # 3. Lien inscription — si disponible
         lien = offer.get("lien_inscription", "").strip()
         if lien:
             msg = f"👉 *Inscrivez-vous ici :*\n{lien}\n\n⚠️ Places limitées — ne tardez pas !"
-            ok = await self._post_with_retry(phone, {"to": phone, "text": msg})
+            ok = await self._post(phone, {"to": phone, "text": msg})
+            logger.info(f"🔗 Lien {'envoyé ✅' if ok else 'échec ❌'} → {phone}")
 
         return ok
-
-    async def _post_with_retry(self, phone: str, payload: dict, max_retries: int = 3) -> bool:
-        """Envoie avec retry automatique en cas de 429 (rate limit)."""
-        for attempt in range(max_retries):
-            result = await self._post(phone, payload)
-            if result:
-                return True
-            if attempt < max_retries - 1:
-                wait = 65 * (attempt + 1)
-                logger.warning(f"⏳ Retry {attempt+1}/{max_retries} dans {wait}s...")
-                await asyncio.sleep(wait)
-        return False
 
     # ── Internals ──────────────────────────────────────────────────────────────
     async def _post(self, phone: str, payload: dict) -> bool:
