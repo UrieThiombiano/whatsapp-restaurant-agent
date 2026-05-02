@@ -45,37 +45,39 @@ class WhatsAppService:
     # ── Offre spéciale : image + message séparé ────────────────────────────────
     async def send_offer(self, phone: str, offer: dict) -> bool:
         """
-        Envoie une offre spéciale complète (plan payant Wasender — pas de limite) :
-        1. Le flyer (image)
-        2. La description complète
-        3. Le lien d'inscription
-        Tous les éléments sont TOUJOURS envoyés même si image_url est vide.
+        Envoie une offre spéciale complète :
+        1. Flyer (image)
+        2. Description (texte — via send() pour gérer les messages longs)
+        3. Lien d'inscription
         """
         ok = True
 
-        # 1. Flyer — toujours tenter si image_url présente
+        # 1. Flyer
         image_url = offer.get("image_url", "").strip()
         if image_url:
             img_ok = await self.send_image(phone, image_url)
-            logger.info(f"🖼️ Flyer {'envoyé ✅' if img_ok else 'échec ❌'} → {phone}")
-            await asyncio.sleep(0.8)
+            logger.info(f"🖼️ Flyer {'✅' if img_ok else '❌'} → {phone}")
+            await asyncio.sleep(1.0)
         else:
-            logger.warning(f"⚠️ Pas d'image_url pour l'offre '{offer.get('titre','?')}' — vérifier Supabase")
+            logger.warning(f"⚠️ image_url vide pour '{offer.get('titre','?')}'")
 
-        # 2. Description complète — OBLIGATOIRE
+        # 2. Description — via send() qui gère le découpage si trop long
         description = offer.get("description", "").strip()
         if description:
-            ok = await self._post(phone, {"to": phone, "text": description})
-            logger.info(f"📝 Description {'envoyée ✅' if ok else 'échec ❌'} → {phone}")
-            await asyncio.sleep(0.8)
+            ok = await self.send(phone, description)
+            logger.info(f"📝 Description {'✅' if ok else '❌'} → {phone}")
+            await asyncio.sleep(1.0)
+        else:
+            logger.warning(f"⚠️ Description vide pour '{offer.get('titre','?')}'")
 
-        # 3. Lien inscription — si disponible
+        # 3. Lien inscription
         lien = offer.get("lien_inscription", "").strip()
         if lien:
-            msg = f"👉 *Inscrivez-vous ici :*\n{lien}\n\n⚠️ Places limitées — ne tardez pas !"
-            ok = await self._post(phone, {"to": phone, "text": msg})
-            logger.info(f"🔗 Lien {'envoyé ✅' if ok else 'échec ❌'} → {phone}")
+            msg = "👉 *Inscrivez-vous ici :*\n" + lien + "\n\n⚠️ Places limitées — ne tardez pas !"
+            ok = await self.send(phone, msg)
+            logger.info(f"🔗 Lien {'✅' if ok else '❌'} → {phone}")
 
+        logger.info(f"🎯 Offre '{offer.get('titre','?')}' envoyée complètement → {phone}")
         return ok
 
     # ── Internals ──────────────────────────────────────────────────────────────
