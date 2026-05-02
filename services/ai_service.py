@@ -277,26 +277,69 @@ class AIService:
                 messages=enriched_history,
             )
             raw = response.content[0].text.strip()
-
-            if raw.startswith("```"):
-                parts = raw.split("```")
-                raw = parts[1] if len(parts) > 1 else raw
-                if raw.lower().startswith("json"):
-                    raw = raw[4:]
-
-            result = json.loads(raw.strip())
+            result = self._parse_json_safe(raw)
             logger.info(f"🤖 Action={result.get('action','NONE')} | Reply='{result.get('reply','')[:80]}'")
             return result
 
-        except json.JSONDecodeError:
-            logger.error(f"JSON invalide : {raw[:200]}")
-            return {"reply": raw[:400] if raw else self._fallback(), "action": "NONE", "action_data": {}}
         except anthropic.APIStatusError as e:
             logger.error(f"Anthropic error : {e}")
             return {"reply": self._fallback(), "action": "NONE", "action_data": {}}
         except Exception as e:
             logger.error(f"chat() error : {e}", exc_info=True)
             return {"reply": self._fallback(), "action": "NONE", "action_data": {}}
+
+    @staticmethod
+    def _parse_json_safe(raw: str) -> dict:
+        """
+        Parseur JSON ultra-robuste.
+        Essaie plusieurs stratégies pour extraire le JSON même si Claude
+        ajoute du texte, des backticks ou d'autres éléments autour.
+        NE JAMAIS retourner le JSON brut comme reply.
+        """
+        import re
+
+        if not raw:
+            return {"reply": AIService._fallback(), "action": "NONE", "action_data": {}}
+
+        # Stratégie 1 : JSON direct
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            pass
+
+        # Stratégie 2 : Nettoyer les backticks markdown
+        cleaned = raw
+        if "```" in cleaned:
+            parts = cleaned.split("```")
+            for part in parts:
+                part = part.strip()
+                if part.lower().startswith("json"):
+                    part = part[4:].strip()
+                try:
+                    return json.loads(part)
+                except json.JSONDecodeError:
+                    continue
+
+        # Stratégie 3 : Extraire le premier bloc { ... } avec regex
+        match = re.search(r'\{[\s\S]*\}', raw)
+        if match:
+            try:
+                return json.loads(match.group())
+            except json.JSONDecodeError:
+                pass
+
+        # Stratégie 4 : Le modèle a peut-être répondu en texte brut
+        # → On prend le texte et on le wrap dans un reply valide
+        # MAIS on vérifie qu'il ne contient pas de JSON partiel
+        logger.error(f"❌ JSON non parseable — raw: {raw[:200]}")
+        # Si le texte ressemble à du JSON → fallback générique
+        if any(k in raw[:50] for k in ['"reply"', '"action"', '{"', 'json']):
+            return {"reply": AIService._fallback(), "action": "NONE", "action_data": {}}
+        # Sinon le texte brut est peut-être une vraie réponse
+        if len(raw) < 500 and not raw.startswith('{'):
+            return {"reply": raw.strip(), "action": "NONE", "action_data": {}}
+
+        return {"reply": AIService._fallback(), "action": "NONE", "action_data": {}}
 
     @staticmethod
     def _fallback() -> str:
