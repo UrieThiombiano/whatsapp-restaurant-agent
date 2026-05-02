@@ -226,11 +226,16 @@ async def handle_incoming(payload: dict):
         topics = topics[-5:]
 
         # ── Charger base connaissance + offres ────────────────────────────────
-        kb, offres = await _load_context()
+        kb, offres, special_offers_ctx = await _load_context()
 
         # ── Appel IA ──────────────────────────────────────────────────────────
         history.append({"role": "user", "content": text})
-        result  = await ai_service.chat(history, knowledge_base=kb, offres=offres)
+        result  = await ai_service.chat(
+            history,
+            knowledge_base=kb,
+            offres=offres,
+            special_offers=special_offers_ctx
+        )
         reply   = result.get("reply", "").strip()
 
         # Message de clôture / rire / acquiescement → ne pas répondre
@@ -280,6 +285,26 @@ async def handle_incoming(payload: dict):
             )
             logger.warning(f"🚨 Tentative sécurité enregistrée : {phone} → '{text[:80]}'")
 
+        elif action == "SEND_OFFER":
+            offer_id = action_data.get("offer_id", "")
+            active_offers = await supabase.get_active_offers()
+            offers_to_send = []
+            if offer_id:
+                # Chercher l'offre par ID ou par titre partiel
+                offers_to_send = [
+                    o for o in active_offers
+                    if str(o.get("id")) == offer_id or
+                       offer_id.lower() in o.get("titre", "").lower()
+                ]
+            if not offers_to_send:
+                # Envoyer toutes les offres actives
+                offers_to_send = active_offers
+
+            for offer in offers_to_send:
+                await whatsapp.send_offer(phone, offer)
+                await asyncio.sleep(1.5)  # Délai entre chaque offre
+            logger.info(f"🎯 {len(offers_to_send)} offre(s) envoyée(s) → {phone}")
+
         # ── Nettoyage périodique (1 fois sur 20) ──────────────────────────────
         import random
         if random.randint(1, 20) == 1:
@@ -301,12 +326,16 @@ async def handle_incoming(payload: dict):
 async def _load_context() -> tuple:
     import asyncio
     try:
-        kb, offres = await asyncio.gather(
+        kb, offres, special = await asyncio.gather(
             sheets.get_knowledge_base(),
             sheets.get_offres(),
+            supabase.get_offers_summary(),
             return_exceptions=True
         )
-        return (kb if not isinstance(kb, Exception) else ""), \
-               (offres if not isinstance(offres, Exception) else "")
-    except Exception:
-        return "", ""
+        kb      = kb      if not isinstance(kb, Exception)      else ""
+        offres  = offres  if not isinstance(offres, Exception)  else ""
+        special = special if not isinstance(special, Exception) else ""
+        return kb, offres, special
+    except Exception as e:
+        logger.error(f"_load_context: {e}")
+        return "", "", ""

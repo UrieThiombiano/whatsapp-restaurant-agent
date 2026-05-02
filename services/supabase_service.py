@@ -174,3 +174,46 @@ class SupabaseService:
             return True
         except Exception:
             return False
+
+    # ── Offres spéciales ───────────────────────────────────────────────────────
+    async def get_active_offers(self) -> list[dict]:
+        """
+        Retourne toutes les offres spéciales actives.
+        Filtre par date_fin si définie.
+        """
+        if not self._client:
+            return []
+        try:
+            from datetime import date
+            today = date.today().isoformat()
+            resp = (
+                self._client.table("special_offers")
+                .select("*")
+                .eq("actif", True)
+                .or_(f"date_fin.is.null,date_fin.gte.{today}")
+                .order("ordre")
+                .execute()
+            )
+            offers = resp.data or []
+            logger.info(f"✅ {len(offers)} offre(s) spéciale(s) active(s)")
+            return offers
+        except Exception as e:
+            logger.error(f"❌ get_active_offers : {e}")
+            return []
+
+    async def get_offers_summary(self) -> str:
+        """
+        Retourne un résumé texte des offres actives pour injection dans le prompt IA.
+        """
+        offers = await self.get_active_offers()
+        if not offers:
+            return ""
+        lines = ["OFFRES SPÉCIALES EN COURS :"]
+        for o in offers:
+            line = f"• {o['titre']} | Cible: {o['cible']} | Prix: {o['prix']}"
+            if o.get("date_debut"):
+                line += f" | Date: {o['date_debut']}"
+            if o.get("lien_inscription"):
+                line += f" | Lien: {o['lien_inscription']}"
+            lines.append(line)
+        return "\n".join(lines)
