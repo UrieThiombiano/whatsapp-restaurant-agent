@@ -285,25 +285,48 @@ async def handle_incoming(payload: dict):
             )
             logger.warning(f"🚨 Tentative sécurité enregistrée : {phone} → '{text[:80]}'")
 
+        elif action == "HINT_OFFER":
+            # L'IA a déjà mis la phrase d'accroche dans reply
+            # On enregistre juste que ce client est intéressé
+            offer_titre = action_data.get("offer_titre", "")
+            logger.info(f"💡 Hint offre spéciale → {phone} | offre: {offer_titre}")
+            # Enregistrer comme lead chaud
+            await sheets.save_lead({
+                "telephone": phone,
+                "nom":       name,
+                "type":      "INTERET_OFFRE_SPECIALE",
+                "details":   f"Intérêt pour offre spéciale : {offer_titre}",
+            })
+
         elif action == "SEND_OFFER":
-            offer_id = action_data.get("offer_id", "")
+            # Le client a demandé les détails → on envoie tout
+            offer_titre  = action_data.get("offer_titre", "")
             active_offers = await supabase.get_active_offers()
+
+            # Chercher l'offre par titre partiel
             offers_to_send = []
-            if offer_id:
-                # Chercher l'offre par ID ou par titre partiel
+            if offer_titre:
                 offers_to_send = [
                     o for o in active_offers
-                    if str(o.get("id")) == offer_id or
-                       offer_id.lower() in o.get("titre", "").lower()
+                    if offer_titre.lower() in o.get("titre", "").lower() or
+                       any(kw in offer_titre.lower() for kw in
+                           o.get("cible", "").lower().split(","))
                 ]
             if not offers_to_send:
-                # Envoyer toutes les offres actives
-                offers_to_send = active_offers
+                offers_to_send = active_offers  # Envoyer toutes si aucune trouvée
 
             for offer in offers_to_send:
                 await whatsapp.send_offer(phone, offer)
-                await asyncio.sleep(1.5)  # Délai entre chaque offre
+                await asyncio.sleep(1.5)
             logger.info(f"🎯 {len(offers_to_send)} offre(s) envoyée(s) → {phone}")
+
+            # Enregistrer comme lead chaud
+            await sheets.save_lead({
+                "telephone": phone,
+                "nom":       name,
+                "type":      "LEAD_OFFRE_SPECIALE",
+                "details":   f"A demandé détails offre : {offer_titre}",
+            })
 
         # ── Nettoyage périodique (1 fois sur 20) ──────────────────────────────
         import random
