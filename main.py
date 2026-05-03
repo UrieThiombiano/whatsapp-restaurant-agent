@@ -74,14 +74,65 @@ whatsapp   = WhatsAppService()
 sheets     = SheetsService()
 supabase   = SupabaseService()
 
-# ── Cache session léger (évite de recharger Supabase à chaque message rapide) ─
-# { phone: { history, name, last_seen, topics, last_loaded } }
+# ── Cache session in-process avec TTL court (évite les allers-retours Supabase ─
+# En cas de redémarrage Render, Supabase est la source de vérité absolue
+# Le cache RAM est juste un accélérateur pour les messages rapides (même session)
 _session_cache: dict = {}
-SESSION_CACHE_TTL = 300  # 5 min — après, on recharge depuis Supabase
+SESSION_CACHE_TTL = 120  # 2 min seulement — reload fréquent pour cohérence
+_KEEPALIVE_URL   = None  # Sera auto-rempli au démarrage (anti cold-start)
 
 WEBHOOK_SECRET = os.getenv("WASENDER_WEBHOOK_SECRET", "")
 
+import asyncio as _asyncio
+from collections import defaultdict
+from asyncio import Queue
+
 app = FastAPI(title="🤖 PUKRI AI SYSTEMS Agent", version="4.0.0")
+
+# ── File de messages par client (évite les doublons si client écrit vite) ──────
+_message_queues: dict[str, Queue] = defaultdict(lambda: Queue(maxsize=10))
+_queue_workers:  dict[str, bool]  = {}
+
+# ── Startup : vérification connexions + keepalive anti cold-start ─────────────
+@app.on_event("startup")
+async def startup_event():
+    logger.info("🚀 PUKRI Agent démarrage...")
+    # Vérifier Supabase
+    try:
+        ok = await supabase.ping()
+        logger.info(f"{'✅' if ok else '⚠️'} Supabase : {'OK' if ok else 'indisponible'}")
+    except Exception as e:
+        logger.warning(f"⚠️ Supabase ping: {e}")
+    # Vérifier Google Sheets
+    try:
+        cfg = await sheets.get_offres()
+        logger.info(f"✅ Google Sheets : {len(cfg)} chars offres")
+    except Exception as e:
+        logger.warning(f"⚠️ Google Sheets: {e}")
+    # Lancer le keepalive anti cold-start Render
+    _asyncio.create_task(_keepalive_loop())
+    logger.info("✅ Agent prêt !")
+
+async def _keepalive_loop():
+    """
+    Ping automatique toutes les 10 minutes pour éviter le cold start Render.
+    Render free tier endort le service après 15 min d'inactivité.
+    Ce ping maintient le serveur éveillé 24/7.
+    """
+    import httpx, os
+    service_url = os.getenv("RENDER_EXTERNAL_URL", "")
+    if not service_url:
+        logger.info("⏭️  RENDER_EXTERNAL_URL non défini — keepalive désactivé")
+        return
+    logger.info(f"💓 Keepalive actif → {service_url}")
+    while True:
+        await _asyncio.sleep(600)  # Toutes les 10 min
+        try:
+            async with httpx.AsyncClient(timeout=10) as c:
+                await c.get(f"{service_url}/")
+            logger.debug("💓 Keepalive ping OK")
+        except Exception as e:
+            logger.warning(f"💓 Keepalive ping échoué: {e}")
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
@@ -151,7 +202,23 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
             payload = json.loads(body)
         except json.JSONDecodeError:
             return JSONResponse({"status": "ok"}, status_code=200)
-        background_tasks.add_task(handle_incoming, payload)
+        # ── Queue par client pour traitement ordonné ─────────────────────────
+        # Évite les race conditions si un client écrit plusieurs messages vite
+        phone_raw = _extract_phone_quick(payload)
+        if phone_raw:
+            queue = _message_queues[phone_raw]
+            try:
+                queue.put_nowait(payload)
+            except _asyncio.QueueFull:
+                logger.warning(f"⚠️ Queue pleine pour {phone_raw} — message ignoré")
+                return JSONResponse({"status": "ok"}, status_code=200)
+
+            if not _queue_workers.get(phone_raw):
+                _queue_workers[phone_raw] = True
+                background_tasks.add_task(_process_queue, phone_raw)
+        else:
+            background_tasks.add_task(handle_incoming, payload)
+
         return JSONResponse({"status": "ok"}, status_code=200)
     except Exception as e:
         logger.error(f"Webhook: {e}", exc_info=True)
@@ -225,6 +292,42 @@ async def get_session(phone: str, push_name: str) -> dict:
     _session_cache[phone] = session
     return session
 
+
+# ── Extraction rapide du phone (pour le routing queue) ───────────────────────
+def _extract_phone_quick(payload: dict) -> str:
+    """Extrait le numéro de téléphone rapidement sans parsing complet."""
+    try:
+        data = payload.get("data", {})
+        msg  = data.get("messages", {})
+        key  = msg.get("key", {})
+        if key.get("fromMe"):
+            return ""
+        return key.get("cleanedSenderPn", "") or key.get("senderPn", "").replace("@s.whatsapp.net", "")
+    except Exception:
+        return ""
+
+# ── Worker de queue par client ────────────────────────────────────────────────
+async def _process_queue(phone: str):
+    """
+    Traite les messages d'un client en séquence.
+    Un seul worker actif par numéro de téléphone.
+    Si le client écrit 3 messages vite, ils sont traités dans l'ordre.
+    """
+    queue = _message_queues[phone]
+    try:
+        while not queue.empty():
+            payload = await queue.get()
+            try:
+                await handle_incoming(payload)
+            except Exception as e:
+                logger.error(f"❌ _process_queue error pour {phone}: {e}")
+            finally:
+                queue.task_done()
+            # Délai minimal entre 2 messages du même client
+            if not queue.empty():
+                await _asyncio.sleep(0.5)
+    finally:
+        _queue_workers[phone] = False
 
 # ── Traitement principal ───────────────────────────────────────────────────────
 async def handle_incoming(payload: dict):

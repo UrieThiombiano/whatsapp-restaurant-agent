@@ -351,54 +351,85 @@ class AIService:
     @staticmethod
     def _parse_json_safe(raw: str) -> dict:
         """
-        Parseur JSON ultra-robuste.
-        Essaie plusieurs stratégies pour extraire le JSON même si Claude
-        ajoute du texte, des backticks ou d'autres éléments autour.
-        NE JAMAIS retourner le JSON brut comme reply.
+        Parseur JSON bullet-proof — 5 stratégies dans l'ordre.
+        Ne retourne JAMAIS le JSON brut comme reply au client.
         """
         import re
 
         if not raw:
             return {"reply": AIService._fallback(), "action": "NONE", "action_data": {}}
 
-        # Stratégie 1 : JSON direct
+        def _validate(d: dict) -> bool:
+            """Vérifie que le dict a la structure minimale attendue."""
+            return (
+                isinstance(d, dict) and
+                "reply" in d and
+                isinstance(d.get("reply"), str) and
+                len(d.get("reply", "")) > 0
+            )
+
+        def _clean_and_parse(s: str):
+            s = s.strip()
+            # Supprimer préfixe 'json' si présent
+            if s.lower().startswith("json"):
+                s = s[4:].strip()
+            # Supprimer les caractères de contrôle invisibles
+            s = s.replace("\x00", "").replace("\r", "")
+            return json.loads(s)
+
+        # Stratégie 1 : JSON direct (cas nominal)
         try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
+            d = _clean_and_parse(raw)
+            if _validate(d):
+                return d
+        except (json.JSONDecodeError, Exception):
             pass
 
-        # Stratégie 2 : Nettoyer les backticks markdown
-        cleaned = raw
-        if "```" in cleaned:
-            parts = cleaned.split("```")
+        # Stratégie 2 : Nettoyer les backticks markdown ```json ... ```
+        if "```" in raw:
+            parts = raw.split("```")
             for part in parts:
-                part = part.strip()
-                if part.lower().startswith("json"):
-                    part = part[4:].strip()
                 try:
-                    return json.loads(part)
-                except json.JSONDecodeError:
+                    d = _clean_and_parse(part)
+                    if _validate(d):
+                        return d
+                except (json.JSONDecodeError, Exception):
                     continue
 
-        # Stratégie 3 : Extraire le premier bloc { ... } avec regex
-        match = re.search(r'\{[\s\S]*\}', raw)
-        if match:
+        # Stratégie 3 : Extraire le bloc JSON le plus grand avec regex
+        # Cherche le { ... } le plus large (glouton)
+        matches = re.findall(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', raw, re.DOTALL)
+        for match in sorted(matches, key=len, reverse=True):
             try:
-                return json.loads(match.group())
-            except json.JSONDecodeError:
-                pass
+                d = _clean_and_parse(match)
+                if _validate(d):
+                    return d
+            except (json.JSONDecodeError, Exception):
+                continue
 
-        # Stratégie 4 : Le modèle a peut-être répondu en texte brut
-        # → On prend le texte et on le wrap dans un reply valide
-        # MAIS on vérifie qu'il ne contient pas de JSON partiel
-        logger.error(f"❌ JSON non parseable — raw: {raw[:200]}")
-        # Si le texte ressemble à du JSON → fallback générique
-        if any(k in raw[:50] for k in ['"reply"', '"action"', '{"', 'json']):
-            return {"reply": AIService._fallback(), "action": "NONE", "action_data": {}}
-        # Sinon le texte brut est peut-être une vraie réponse
-        if len(raw) < 500 and not raw.startswith('{'):
-            return {"reply": raw.strip(), "action": "NONE", "action_data": {}}
+        # Stratégie 4 : Tenter de reconstruire le JSON si "reply" est présent
+        reply_match = re.search(r'"reply"\s*:\s*"((?:[^"\\]|\\.)*)"', raw)
+        action_match = re.search(r'"action"\s*:\s*"([A-Z_]+)"', raw)
+        if reply_match:
+            reconstructed = {
+                "reply":       reply_match.group(1).replace("\\n", "\n"),
+                "action":      action_match.group(1) if action_match else "NONE",
+                "action_data": {}
+            }
+            if _validate(reconstructed):
+                logger.warning(f"⚠️ JSON reconstruit depuis regex — raw: {raw[:100]}")
+                return reconstructed
 
+        # Stratégie 5 : Texte brut sans JSON → wrapper propre
+        # Seulement si le texte ne ressemble pas du tout à du JSON
+        raw_stripped = raw.strip()
+        json_smell = any(k in raw_stripped[:80] for k in ['"reply"', '"action"', '{', 'json', '```'])
+        if not json_smell and len(raw_stripped) < 800:
+            logger.warning(f"⚠️ Réponse texte brut utilisée : {raw_stripped[:80]}")
+            return {"reply": raw_stripped, "action": "NONE", "action_data": {}}
+
+        # Échec total → fallback propre (jamais de JSON brut vers le client)
+        logger.error(f"❌ JSON impossible à parser après 5 stratégies — raw: {raw[:200]}")
         return {"reply": AIService._fallback(), "action": "NONE", "action_data": {}}
 
     @staticmethod

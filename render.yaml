@@ -1,0 +1,26 @@
+# render.yaml — Configuration Render pour PUKRI Agent
+services:
+  - type: web
+    name: pukri-whatsapp-agent
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 2 --loop uvloop
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: WASENDER_API_KEY
+        sync: false
+      - key: WASENDER_WEBHOOK_SECRET
+        sync: false
+      - key: GOOGLE_SHEET_ID
+        sync: false
+      - key: GOOGLE_CREDENTIALS_B64
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: RENDER_EXTERNAL_URL
+        sync: false
