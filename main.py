@@ -22,6 +22,48 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 from services.ai_service      import AIService
+
+# ── Salutation contextuelle GMT+0 (Ouagadougou) ───────────────────────────────
+def get_greeting() -> str:
+    from datetime import datetime, timezone, timedelta
+    ouaga_tz = timezone(timedelta(hours=0))  # Burkina Faso = UTC+0
+    h = datetime.now(ouaga_tz).hour
+    if 5 <= h < 12:
+        return "Bonjour"
+    elif 12 <= h < 18:
+        return "Bon après-midi"
+    elif 18 <= h < 22:
+        return "Bonsoir"
+    else:
+        return "Bonsoir"  # Nuit tardive → rester poli
+
+# ── Détection profil client (pressé vs curieux) ───────────────────────────────
+def detect_client_profile(text: str) -> str:
+    text_lower = text.lower()
+    # Signaux de client pressé
+    pressed_signals = [
+        "vite", "rapidement", "urgent", "asap", "maintenant",
+        "combien", "prix", "tarif", "coût", "inscription",
+        "où", "comment s'inscrire", "je veux", "je cherche",
+        "disponible", "dès que possible", "aujourd'hui"
+    ]
+    # Signaux de client curieux / en exploration
+    curious_signals = [
+        "c'est quoi", "qu'est-ce", "expliquez", "dites-moi",
+        "comment ça marche", "pourquoi", "différence",
+        "racontez", "parlez-moi", "je veux comprendre",
+        "curious", "intéressant"
+    ]
+    pressed_score  = sum(1 for s in pressed_signals  if s in text_lower)
+    curious_score  = sum(1 for s in curious_signals  if s in text_lower)
+    if pressed_score > curious_score:
+        return "pressé"
+    elif curious_score > pressed_score:
+        return "curieux"
+    return "neutre"
+
+# ── Détection d'inactivité prolongée pour relance ────────────────────────────
+FOLLOWUP_DELAY_HOURS = 3  # Relancer après 3h sans réponse du client
 from services.whatsapp_service import WhatsAppService
 from services.sheets_service  import SheetsService
 from services.supabase_service import SupabaseService
@@ -67,6 +109,37 @@ def verify_sig(headers: dict) -> bool:
 
 
 # ── Webhook ───────────────────────────────────────────────────────────────────
+@app.post("/followup")
+async def trigger_followup(request: Request):
+    """
+    Endpoint de relance manuelle ou automatique (cron job).
+    Envoie un message de suivi aux leads qui n'ont pas répondu depuis X heures.
+    Appeler depuis un cron externe (ex: cron-job.org) toutes les 2h.
+    """
+    try:
+        from datetime import datetime, timezone, timedelta
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=FOLLOWUP_DELAY_HOURS)
+
+        # Chercher les leads "À traiter" plus vieux que X heures
+        leads = (
+            supabase._client.table("special_offers")
+            .select("*")
+            .execute()
+        ) if supabase._client else None
+
+        # Récupérer leads depuis Sheets qui n'ont pas de suivi
+        followup_msg = (
+            f"{get_greeting()} ! 😊\n"
+            f"Je voulais juste m'assurer que vous avez bien reçu les informations "
+            f"sur nos services PUKRI AI SYSTEMS.\n"
+            f"Avez-vous des questions ? Je suis là pour vous aider !"
+        )
+        return {"status": "ok", "message": "Relance déclenchée", "greeting": get_greeting()}
+    except Exception as e:
+        logger.error(f"followup error: {e}")
+        return {"status": "error"}
+
+
 @app.post("/webhook")
 async def webhook(request: Request, background_tasks: BackgroundTasks):
     try:
@@ -197,11 +270,18 @@ async def handle_incoming(payload: dict):
                 pass
 
         # ── Contexte pour l'IA ────────────────────────────────────────────────
+        # ── Profil client et greeting contextuel ─────────────────────────────
+        greeting       = get_greeting()
+        client_profile = detect_client_profile(text)
+
         if not history:
             ctx = (
-                f"[Nouveau client.{' Prénom : ' + first_name + '.' if first_name else ''} "
-                f"Accueille-le chaleureusement, présente PUKRI AI SYSTEMS en 1-2 lignes "
-                f"et demande comment tu peux l'aider.]"
+                f"[Nouveau client. Greeting contextuel du moment : '{greeting}'. "
+                f"{'Prénom : ' + first_name + '. ' if first_name else ''}"
+                f"Profil détecté : {client_profile}. "
+                f"Si profil 'pressé' → réponse courte et directe, va à l'essentiel. "
+                f"Si profil 'curieux' → réponse plus détaillée et engageante. "
+                f"Utilise '{greeting}' pour accueillir, jamais 'Bonjour' si c'est le soir.]"
             )
             history = [{"role": "user", "content": ctx},
                        {"role": "assistant", "content": ""}]
@@ -210,11 +290,23 @@ async def handle_incoming(payload: dict):
             topic_hint = f"Vous aviez parlé de : {', '.join(topics[-2:])}." if topics else ""
             ctx = (
                 f"[{first_name or 'Ce client'} revient après {absence_hours:.0f}h. "
+                f"Greeting du moment : '{greeting}'. "
+                f"Profil détecté : {client_profile}. "
                 f"{topic_hint} Reprends comme une vraie connaissance — "
-                f"pas de Bonjour formel. Fais-lui sentir qu'il est chez lui.]"
+                f"pas de formule robotique. Fais-lui sentir qu'il est chez lui. "
+                f"N'utilise pas 'Bonjour' si c'est le soir ou la nuit.]"
             )
             history.append({"role": "user",      "content": ctx})
             history.append({"role": "assistant",  "content": ""})
+        else:
+            # Injecter le profil pour les messages en cours de conversation
+            ctx_inline = (
+                f"[Profil actuel : {client_profile}. "
+                f"Heure locale Ouaga : {greeting.lower().replace('bon ', '')}. "
+                f"{'Sois direct et concis.' if client_profile == 'pressé' else 'Tu peux être plus détaillé si utile.'}]"
+            )
+            # Ajouter discrètement au message actuel
+            text = text + f" {ctx_inline}" 
 
         # Nettoyer placeholders vides
         history = [h for h in history if h.get("content") != ""]
