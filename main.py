@@ -22,6 +22,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 from services.ai_service      import AIService
+from services.lead_service    import LeadService
 
 # ── Salutation contextuelle GMT+0 (Ouagadougou) ───────────────────────────────
 def get_greeting() -> str:
@@ -69,10 +70,11 @@ from services.sheets_service  import SheetsService
 from services.supabase_service import SupabaseService
 
 # ── Services ──────────────────────────────────────────────────────────────────
-ai_service = AIService()
-whatsapp   = WhatsAppService()
-sheets     = SheetsService()
-supabase   = SupabaseService()
+ai_service   = AIService()
+whatsapp     = WhatsAppService()
+sheets       = SheetsService()
+supabase     = SupabaseService()
+lead_service = None  # Initialisé dans startup (dépend de supabase + whatsapp)
 
 # ── Cache session in-process avec TTL court (évite les allers-retours Supabase ─
 # En cas de redémarrage Render, Supabase est la source de vérité absolue
@@ -111,6 +113,9 @@ async def startup_event():
         logger.warning(f"⚠️ Google Sheets: {e}")
     # Lancer le keepalive anti cold-start Render
     _asyncio.create_task(_keepalive_loop())
+    global lead_service
+    lead_service = LeadService(supabase, whatsapp)
+    logger.info("✅ LeadService initialisé")
     logger.info("✅ Agent prêt !")
 
 async def _keepalive_loop():
@@ -160,6 +165,19 @@ def verify_sig(headers: dict) -> bool:
 
 
 # ── Webhook ───────────────────────────────────────────────────────────────────
+@app.post("/process-followups")
+async def process_followups():
+    """
+    Endpoint cron — traite les relances dues.
+    Configurer sur cron-job.org : POST toutes les 30 minutes.
+    URL : https://votre-url.onrender.com/process-followups
+    """
+    if not lead_service:
+        return {"status": "error", "message": "LeadService non initialisé"}
+    sent = await lead_service.process_due_followups()
+    return {"status": "ok", "relances_envoyees": sent}
+
+
 @app.post("/followup")
 async def trigger_followup(request: Request):
     """
@@ -460,6 +478,13 @@ async def handle_incoming(payload: dict):
             "last_loaded": time.time(),
         }
 
+        # ── Qualification silencieuse à chaque message ───────────────────────
+        if lead_service:
+            qual_updates = LeadService.extract_qualification_signals(text)
+            if qual_updates:
+                qual_updates["service_vise"] = qual_updates.get("service_vise", "") or ",".join(topics) or ""
+                asyncio.create_task(lead_service.update_qualification(phone, name, qual_updates))
+
         # ── Actions Google Sheets ─────────────────────────────────────────────
         if action == "LEAD":
             await sheets.save_lead({
@@ -468,6 +493,15 @@ async def handle_incoming(payload: dict):
                 "type":      action_data.get("type", "INTERET"),
                 "details":   action_data.get("details", text[:200]),
             })
+            # Planifier les relances automatiques
+            if lead_service:
+                service = action_data.get("type", "").lower().replace("interet_", "").replace("lead_", "") or ",".join(topics)
+                await lead_service.schedule_followups(phone, name, service)
+                # Enrichir la qualification avec les données IA
+                qual_from_ai = action_data.get("qualification", {})
+                if qual_from_ai:
+                    asyncio.create_task(lead_service.update_qualification(phone, name, qual_from_ai))
+                logger.info(f"📅 Relances J+1/J+3/J+7 planifiées → {phone}")
         elif action == "UNKNOWN":
             await sheets.save_unknown_question(phone, name,
                 action_data.get("question", text))
@@ -481,17 +515,16 @@ async def handle_incoming(payload: dict):
             logger.warning(f"🚨 Tentative sécurité enregistrée : {phone} → '{text[:80]}'")
 
         elif action == "HINT_OFFER":
-            # L'IA a déjà mis la phrase d'accroche dans reply
-            # On enregistre juste que ce client est intéressé
             offer_titre = action_data.get("offer_titre", "")
             logger.info(f"💡 Hint offre spéciale → {phone} | offre: {offer_titre}")
-            # Enregistrer comme lead chaud
             await sheets.save_lead({
                 "telephone": phone,
                 "nom":       name,
                 "type":      "INTERET_OFFRE_SPECIALE",
                 "details":   f"Intérêt pour offre spéciale : {offer_titre}",
             })
+            if lead_service:
+                await lead_service.schedule_followups(phone, name, "formation")
 
         elif action == "SEND_OFFER":
             # Le client a demandé les détails → on envoie tout
