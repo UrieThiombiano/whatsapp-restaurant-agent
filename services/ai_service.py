@@ -197,7 +197,7 @@ Quand un client exprime de l'intérêt pour un service (formation, consulting, a
 RÈGLES IMPORTANTES :
 • Ne pas donner les détails de l'offre spéciale sans que le client les demande
 • "vous voulez que je vous envoie les détails ?" = phrase d'accroche, pas envoi automatique
-• Si le client dit "oui", "envoie", "dis-moi", "je veux savoir" → SEND_OFFER
+• Si le client dit "oui", "envoie", "dis-moi", "je veux savoir", "je n'ai pas reçu", "renvoie", "je n'ai rien reçu", "pas reçu" → SEND_OFFER immédiatement
 • Si le client dit "non" → respecter et continuer la conversation normalement
 • Si le client demande "vous avez des offres spéciales ?" → HINT_OFFER sur toutes les offres actives
 
@@ -344,8 +344,8 @@ class AIService:
     @staticmethod
     def _fallback() -> str:
         return (
-            "Bonjour ! 😊 Je suis momentanément indisponible.\n"
-            "Contactez-nous directement :\n"
-            "📱 72 91 80 81 / 75 85 07 12\n"
-            "📧 contact.pukri.ai@gmail.com"
+            "Désolé, j'ai eu un petit souci technique. 🙏\n"
+            "Pouvez-vous reformuler votre message ?\n"
+            "Ou contactez-nous directement :\n"
+            "📱 72 91 80 81 / 75 85 07 12"
         )
