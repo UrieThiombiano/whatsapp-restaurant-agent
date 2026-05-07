@@ -362,25 +362,51 @@ class AIService:
                     }
 
         raw = ""
-        try:
-            response = await self._client.messages.create(
-                model="claude-sonnet-4-5",
-                max_tokens=500,
-                temperature=0.5,
-                system=SYSTEM_PROMPT,
-                messages=enriched_history,
-            )
-            raw = response.content[0].text.strip()
-            result = self._parse_json_safe(raw)
-            logger.info(f"🤖 Action={result.get('action','NONE')} | Reply='{result.get('reply','')[:80]}'")
-            return result
+        # ── Retry automatique : 3 tentatives avec backoff ─────────────────────
+        for attempt in range(3):
+            try:
+                import asyncio as _aio
+                response = await _aio.wait_for(
+                    self._client.messages.create(
+                        model="claude-sonnet-4-5",
+                        max_tokens=400,       # Réduit pour réponse plus rapide
+                        temperature=0.5,
+                        system=SYSTEM_PROMPT,
+                        messages=enriched_history[-20:],  # Max 20 msgs pour réduire latence
+                    ),
+                    timeout=25.0  # 25s max — sinon retry
+                )
+                raw = response.content[0].text.strip()
+                result = self._parse_json_safe(raw)
+                logger.info(f"🤖 Action={result.get('action','NONE')} attempt={attempt+1} | Reply='{result.get('reply','')[:80]}'")
+                return result
 
-        except anthropic.APIStatusError as e:
-            logger.error(f"Anthropic error : {e}")
-            return {"reply": self._fallback(), "action": "NONE", "action_data": {}}
-        except Exception as e:
-            logger.error(f"chat() error : {e}", exc_info=True)
-            return {"reply": self._fallback(), "action": "NONE", "action_data": {}}
+            except _aio.TimeoutError:
+                logger.warning(f"⏱️ Anthropic timeout (tentative {attempt+1}/3)")
+                if attempt < 2:
+                    await _aio.sleep(2 ** attempt)  # 1s, 2s
+                    continue
+                return {"reply": self._fallback_timeout(), "action": "NONE", "action_data": {}}
+
+            except anthropic.APIStatusError as e:
+                logger.error(f"Anthropic APIStatusError (tentative {attempt+1}): {e}")
+                if attempt < 2:
+                    await _aio.sleep(2)
+                    continue
+                return {"reply": self._fallback(), "action": "NONE", "action_data": {}}
+
+            except anthropic.APIConnectionError as e:
+                logger.error(f"Anthropic connexion échouée (tentative {attempt+1}): {e}")
+                if attempt < 2:
+                    await _aio.sleep(3)
+                    continue
+                return {"reply": self._fallback(), "action": "NONE", "action_data": {}}
+
+            except Exception as e:
+                logger.error(f"chat() error inattendu: {e}", exc_info=True)
+                return {"reply": self._fallback(), "action": "NONE", "action_data": {}}
+
+        return {"reply": self._fallback(), "action": "NONE", "action_data": {}}
 
     @staticmethod
     def _parse_json_safe(raw: str) -> dict:
@@ -469,8 +495,14 @@ class AIService:
     @staticmethod
     def _fallback() -> str:
         return (
-            "Désolé, j'ai eu un petit souci technique. 🙏\n"
-            "Pouvez-vous reformuler votre message ?\n"
-            "Ou contactez-nous directement :\n"
-            "📱 72 91 80 81 / 75 85 07 12"
+            "Je traite votre message, une seconde... ⏳\n"
+            "Si vous ne recevez pas de réponse, réécrivez votre message svp !"
+        )
+
+    @staticmethod
+    def _fallback_timeout() -> str:
+        """Fallback spécifique quand l'IA met trop de temps — encourage à réécrire."""
+        return (
+            "Je suis un peu lent en ce moment 😅\n"
+            "Pouvez-vous réécrire votre message ? Je vous réponds tout de suite !"
         )

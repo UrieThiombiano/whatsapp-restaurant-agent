@@ -57,7 +57,6 @@ class WhatsAppService:
         if image_url:
             img_ok = await self.send_image(phone, image_url)
             logger.info(f"🖼️ Flyer {'✅' if img_ok else '❌'} → {phone}")
-            await asyncio.sleep(1.0)
         else:
             logger.warning(f"⚠️ image_url vide pour '{offer.get('titre','?')}'")
 
@@ -66,7 +65,6 @@ class WhatsAppService:
         if description:
             ok = await self.send(phone, description)
             logger.info(f"📝 Description {'✅' if ok else '❌'} → {phone}")
-            await asyncio.sleep(1.0)
         else:
             logger.warning(f"⚠️ Description vide pour '{offer.get('titre','?')}'")
 

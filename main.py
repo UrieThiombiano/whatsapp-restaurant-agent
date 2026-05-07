@@ -131,7 +131,7 @@ async def _keepalive_loop():
         return
     logger.info(f"💓 Keepalive actif → {service_url}")
     while True:
-        await _asyncio.sleep(600)  # Toutes les 10 min
+        await _asyncio.sleep(300)  # Toutes les 5 min (Render free = sleep après 15 min)
         try:
             async with httpx.AsyncClient(timeout=10) as c:
                 await c.get(f"{service_url}/")
@@ -349,6 +349,19 @@ async def _process_queue(phone: str):
 
 # ── Traitement principal ───────────────────────────────────────────────────────
 async def handle_incoming(payload: dict):
+    """Traite un message entrant. Timeout global 55s pour éviter les blocages."""
+    phone = None
+    try:
+        # Timeout global de sécurité — évite qu'un message bloque le worker indéfiniment
+        import asyncio as _asyncio2
+        await _asyncio2.wait_for(_handle_incoming_inner(payload), timeout=55.0)
+    except _asyncio2.TimeoutError:
+        logger.error(f"⏱️ handle_incoming timeout global 55s !")
+    except Exception as e:
+        logger.error(f"❌ handle_incoming wrapper: {e}", exc_info=True)
+
+
+async def _handle_incoming_inner(payload: dict):
     phone = None
     try:
         phone, text, msg_type, push_name = parse_payload(payload)
@@ -565,12 +578,11 @@ async def handle_incoming(payload: dict):
         await whatsapp.send(phone, reply)
 
     except Exception as e:
-        logger.error(f"❌ handle_incoming : {e}", exc_info=True)
+        logger.error(f"❌ _handle_incoming_inner : {e}", exc_info=True)
         if phone:
             await whatsapp.send(
                 phone,
-                "Désolé, souci technique momentané. 🙏\n"
-                "Contactez-nous : 📱 72 91 80 81 / 75 85 07 12"
+                "Je suis lent en ce moment 😅 Réécrivez votre message, je vous réponds !"
             )
 
 
